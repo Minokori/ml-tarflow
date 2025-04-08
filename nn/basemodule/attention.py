@@ -1,5 +1,5 @@
 """注意力模块"""
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Literal, overload
 
 import torch
 
@@ -11,21 +11,28 @@ class Attention(torch.nn.Module):
     """是否使用 `Scaled Dot-Product Attention(SDPA)`, 点积注意力机制"""
 
     if TYPE_CHECKING:
-
-        def __call__(self, x: torch.Tensor, mask: torch.Tensor | None = None, temp: float = 1.0, which_cache: str = 'cond') -> torch.Tensor:
+        @overload
+        def __call__(self,
+                     x: torch.Tensor,
+                     mask: torch.Tensor | None = None,
+                     temp: float = 1.0,
+                     which_cache: Literal["cond", "uncond"] = 'cond') -> torch.Tensor:
             """计算注意力
+
+                `(b, l, c) -> (b, l, c)`
 
             Args:
                 x (torch.Tensor): 输入张量 shape = (Batch, sequence Length, Channel)
-                mask (torch.Tensor | None, optional): _description_. Defaults to None.
+                mask (torch.Tensor | None, optional): 计算注意力时的遮罩. Defaults to None.
                 temp (float, optional): _description_. Defaults to 1.0.
-                which_cache (str, optional): _description_. Defaults to 'cond'.
+                which_cache (str, optional): 有无条件指导. Defaults to 'cond'.
 
             Returns:
-                torch.Tensor: 输出 ,shape = input shape (B,T,C)
+                torch.Tensor: 输出 ,shape = input shape (B, L, C)
             """
             ...
 
+        @overload
         def norm(self, x: torch.Tensor) -> torch.Tensor:
             """层归一化(针对单个样本的不同特征进行归一化)
 
@@ -37,6 +44,7 @@ class Attention(torch.nn.Module):
             """
             ...
 
+        @overload
         def qkv(self, x: torch.Tensor) -> torch.Tensor:
             """计算 Query, Key, Value 的权重矩阵
 
@@ -48,6 +56,7 @@ class Attention(torch.nn.Module):
             """
             ...
 
+        @overload
         def proj(self, x: torch.Tensor) -> torch.Tensor:
             """投影
 
@@ -79,8 +88,11 @@ class Attention(torch.nn.Module):
         self.sqrt_scale = head_channels ** (-0.25)
         """每个注意力头的 缩放点积注意力的缩放因子的平方根"""
         self.sample = False
+        """是否为采样(逆运算)模式"""
         self.k_cache: dict[str, list[torch.Tensor]] = {'cond': [], 'uncond': []}
+        """K矩阵的缓存"""
         self.v_cache: dict[str, list[torch.Tensor]] = {'cond': [], 'uncond': []}
+        """V矩阵的缓存"""
 
     def forward_sdpa(
         self, x: torch.Tensor, mask: torch.Tensor | None = None, temp: float = 1.0, which_cache: str = 'cond'
@@ -110,7 +122,7 @@ class Attention(torch.nn.Module):
         #   -> transpose shape: (b, 3 * h, l, d)
         #   -> chunk     shape: 3 * (b, h, l, d)
 
-        # region [TODO] 和逆运算相关
+        # region TODO 和逆运算相关
         if self.sample:
             self.k_cache[which_cache].append(k)
             self.v_cache[which_cache].append(v)

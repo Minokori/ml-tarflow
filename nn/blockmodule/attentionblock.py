@@ -1,5 +1,5 @@
 """残差注意力块 (一个注意力机制模块 + 一个全连接层, 串联"""
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Literal, overload
 
 import torch
 
@@ -15,7 +15,9 @@ class AttentionBlock(torch.nn.Module):
     """
 
     if TYPE_CHECKING:
-        def __call__(self, x: torch.Tensor, attn_mask: torch.Tensor | None = None, attn_temp: float = 1.0, which_cache: str = 'cond') -> torch.Tensor:
+        @overload
+        def __call__(self, x: torch.Tensor, attn_mask: torch.Tensor | None = None, attn_temp: float = 1.0,
+                     which_cache: Literal["cond", "uncond"] = 'cond') -> torch.Tensor:
             """前向传播
 
             Args:

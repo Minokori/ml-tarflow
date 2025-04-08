@@ -1,6 +1,6 @@
 """多层感知机模块"""
 
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, overload
 
 import torch
 
@@ -12,6 +12,7 @@ class MLP(torch.nn.Module):
     """
 
     if TYPE_CHECKING:
+        @overload
         def norm(self, x: torch.Tensor) -> torch.Tensor:
             """层归一化 (针对单个样本的不同特征进行归一化)
 
@@ -23,6 +24,7 @@ class MLP(torch.nn.Module):
             """
             ...
 
+        @overload
         def main(self, x: torch.Tensor) -> torch.Tensor:
             """主网络 (全连接 -> GELU -> 全连接)
 
@@ -34,8 +36,11 @@ class MLP(torch.nn.Module):
             """
             ...
 
+        @overload
         def __call__(self, x: torch.Tensor) -> torch.Tensor:
             """前向传播
+
+            (b, l, c) -> (b, l, c)
 
             Args:
                 x (torch.Tensor): 输入张量, shape:(Batch, sequence Length, Channel)
