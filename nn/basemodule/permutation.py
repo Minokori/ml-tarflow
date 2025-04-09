@@ -9,26 +9,31 @@ from typing import TYPE_CHECKING, overload
 import torch
 
 
+# 符号说明:
+# B: 批量大小 batch size
+# L: 序列长度 (sequence length)
+# C: 通道数 (channel size)
+
 class Permutation(ABC, torch.nn.Module):
     """置换模块的基类(抽象类)
 
-        该模块用于置换输入张量 (mask操作),
+        该模块用于置换输入张量 (也即流模型中的 "mask" 操作),
         继承该类请重载 `forward()` 方法
     """
     if TYPE_CHECKING:
-
+        @overload
         def __call__(self, x: torch.Tensor, dim: int = 1, inverse: bool = False) -> torch.Tensor:
-            r"""对输入张量 x 进行置换操作
+            r"""对输入张量 `x` 进行置换操作
 
             $$ Output_{(B,L,C)} = Permutation(Input_{(B,L,C)}) $$
 
                 Args:
-                    x (torch.Tensor): 输入张量, shape: (Batch, sequence Length, Channel)
+                    x (torch.Tensor): 输入张量, shape: (B, L, C)
                     dim (int, optional): 要进行置换操作的维度. Defaults to 1.
                     inverse (bool, optional): 是否为逆运算. Defaults to False.
 
                 Returns:
-                    torch.Tensor: 置换后的张量, shape: (Batch, sequence Length, Channel)
+                    torch.Tensor: 置换后的张量, shape: (B, L, C)
                 """
             ...
 
@@ -61,12 +66,12 @@ class PermutationIdentity(Permutation):
             $$ output_{(B,L,W)} = input_{(B,L,W)} $$
 
             Args:
-                x (torch.Tensor): 输入张量, shape: (Batch, sequence Length, Channel)
+                x (torch.Tensor): 输入张量, shape: (B, L, C)
                 dim (int, optional): 要进行置换操作的维度. Defaults to 1.
                 inverse (bool, optional): 是否为逆运算. Defaults to False.
 
             Returns:
-                torch.Tensor: 置换后的张量, shape: (Batch, sequence Length, Channel)
+                torch.Tensor: 置换后的张量, shape: (B, L, C)
             """
             ...
 
@@ -87,12 +92,12 @@ class PermutationFlip(Permutation):
             $$ output_{(B,[1:l],C)} = input_{(B,[l:1],C)} $$
 
             Args:
-                x (torch.Tensor): 输入张量, shape: (Batch, sequence Length, Channel)
+                x (torch.Tensor): 输入张量, shape: (B, L, C)
                 dim (int, optional): 要反转的维度. Defaults to 1.
                 inverse (bool, optional): 是否为逆运算. Defaults to False.
 
             Returns:
-                torch.Tensor: 反转后的张量, shape: (Batch, sequence Length, Channel)
+                torch.Tensor: 反转后的张量, shape: (B, L, C)
             """
             ...
 

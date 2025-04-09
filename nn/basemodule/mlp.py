@@ -5,12 +5,17 @@ from typing import TYPE_CHECKING, overload
 import torch
 
 
+# 符号说明:
+# B: 批量大小 batch size
+# L: 序列长度 (sequence length)
+# C: 通道数 (channel size)
+
+
 class MLP(torch.nn.Module):
     """多层感知机模块
 
     全连接 -> GELU -> 全连接
     """
-
     if TYPE_CHECKING:
         @overload
         def norm(self, x: torch.Tensor) -> torch.Tensor:
@@ -29,10 +34,10 @@ class MLP(torch.nn.Module):
             """主网络 (全连接 -> GELU -> 全连接)
 
             Args:
-                x (torch.Tensor): 输入张量, shape:(Batch, sequence Length, Channel)
+                x (torch.Tensor): 输入张量, shape: (B, L, C)
 
             Returns:
-                torch.Tensor: 输出张量, shape:(Batch, sequence Length, Channel)
+                torch.Tensor: 输出张量, shape: (B, L, C)
             """
             ...
 
@@ -40,13 +45,13 @@ class MLP(torch.nn.Module):
         def __call__(self, x: torch.Tensor) -> torch.Tensor:
             """前向传播
 
-            (b, l, c) -> (b, l, c)
+            shape: (B, L, C) -> (B, L, C)
 
             Args:
-                x (torch.Tensor): 输入张量, shape:(Batch, sequence Length, Channel)
+                x (torch.Tensor): 输入张量, shape: (B, L, C)
 
             Returns:
-                torch.Tensor: 输出张量, shape:(Batch, sequence Length, Channel)
+                torch.Tensor: 输出张量, shape: (B, L, C)
             """
 
     def __init__(self, channels: int, expansion: int):

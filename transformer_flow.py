@@ -11,8 +11,21 @@ from nn.blockmodule import *
 from nn.metablock import MetaBlock
 
 
+# 符号说明:
+# B: 批量大小 batch size
+# L: 序列长度 (sequence length)
+# C: 通道数 (channel size)
+# P: 图像块的边长 (patch size)
+# W: 图像的边长 (image size)
+# L = W * W /P /P
+# H: 注意力头数 (number of attention heads)
+# D: 每个注意力头的维度 (dimension of each attention head)
+# H * D =C
+# C_hidden: 隐藏层通道数
+
 class Model(torch.nn.Module):
     VAR_LR: float = 0.1
+    """更新先验分布时的学习率"""
     var: torch.Tensor
     """先验分布.
 
@@ -52,10 +65,11 @@ class Model(torch.nn.Module):
         """初始化模型
 
         Args:
-            in_channels (int): 输入张量(图片)的通道数, 记为`C`
-            img_size (int): 输入图像的边长, 记为 `W`
-            patch_size (int): 图像分块的边长, 记为 `P`
-            channels (int): MetaBlock 中的隐藏层通道数, 记为 `C_hidden`
+            in_channels (int): 输入张量(图片)的通道数 C
+            
+            img_size (int): 输入图像的边长 W
+            patch_size (int): 图像分块的边长 P
+            channels (int): MetaBlock 中的隐藏层通道数 C_hidden
             num_blocks (int): MetaBlock 的数量
             layers_per_block (int): MetaBlock 中的层数
             nvp (bool, optional): 是否使用 `NVP` 模式. Defaults to True.
@@ -151,7 +165,7 @@ class Model(torch.nn.Module):
         return x, outputs, logdets
 
     def update_prior(self, z: torch.Tensor):
-        """        用 z^2 和 var 的插值更新
+        """用 z^2 和 var 的插值更新
 
         $$ var = var +  (z^2 - var) \times var_{LR} $$
 
@@ -209,18 +223,18 @@ class Model(torch.nn.Module):
         """_summary_
 
         Args:
-            x (torch.Tensor): _description_
+            x (torch.Tensor): 输入张量(序列), shape: (B, L, C*P*P)
             y (torch.Tensor | None, optional): _description_. Defaults to None.
             guidance (float, optional): _description_. Defaults to 0.
             guide_what (str, optional): _description_. Defaults to 'ab'.
             attn_temp (float, optional): _description_. Defaults to 1.0.
             annealed_guidance (bool, optional): _description_. Defaults to False.
-            return_sequence (bool, optional): _description_. Defaults to False.
+            return_sequence (bool, optional): 是否返回序列. 若为否, 则仅返回最终结果(图片); 否则, 将返回每层 MetaBlock 处理后的结果 Defaults to False.
 
         Returns:
             torch.Tensor | list[torch.Tensor]: _description_
         """
-        seq = [self.unpatchify(x)]
+        seq: list[torch.Tensor] = [self.unpatchify(x)]  # 要返回的张量列表(图片) ,shape = (B,C,W,W)
         x = x * self.var.sqrt()
         for block in reversed(self.blocks):
             x = block.reverse(x, y, guidance, guide_what, attn_temp, annealed_guidance)
