@@ -26,9 +26,12 @@ from torchmetrics.image.fid import FrechetInceptionDistance
 
 
 class CosineLRSchedule(torch.nn.Module):
+    """
+    余弦学习率调度器，支持在初始训练阶段使用 warmup 策略。
+    """
     counter: torch.Tensor
 
-    def __init__(self, optimizer, warmup_steps: int, total_steps: int, min_lr: float, max_lr: float):
+    def __init__(self, optimizer:torch.optim.Optimizer, warmup_steps: int, total_steps: int, min_lr: float, max_lr: float):
         super().__init__()
         self.register_buffer('counter', torch.zeros(()))
         self.warmup_steps = warmup_steps
@@ -39,12 +42,18 @@ class CosineLRSchedule(torch.nn.Module):
         self.set_lr(min_lr)
 
     def set_lr(self, lr: float) -> float:
+        """
+        设置并返回当前生效的学习率，若超出边界则截取到[min_lr, max_lr]。
+        """
         if self.min_lr <= lr <= self.max_lr:
-            for pg in self.optimizer.param_groups:
-                pg['lr'] = lr
+            for param_group in self.optimizer.param_groups:
+                param_group['lr'] = lr
         return max(self.min_lr, min(self.max_lr, lr))
 
     def step(self) -> float:
+        """
+        每步递增计数器并计算新的学习率，根据当前阶段（warmup 或余弦退火）更新参数。
+        """
         with torch.no_grad():
             counter = self.counter.add_(1).item()
         if self.counter <= self.warmup_steps:
@@ -57,6 +66,9 @@ class CosineLRSchedule(torch.nn.Module):
 
 
 class Distributed:
+    """
+    用于管理分布式训练环境的工具类。
+    """
 
     def __init__(self):
         if os.environ.get('MASTER_PORT'):  # When running with torchrun
@@ -93,6 +105,9 @@ class FID(FrechetInceptionDistance):
 
 
 class Metrics:
+    """
+    用于收集并计算训练过程中的各种指标。
+    """
     def __init__(self):
         self.metrics: dict[str, list[float]] = {}
 
@@ -125,6 +140,10 @@ def get_num_classes(dataset: str) -> int:
 
 
 def get_data(dataset: str, img_size: int, folder: pathlib.Path) -> tuple[torch.utils.data.Dataset, int]:
+    """
+    根据指定数据集名称 dataset、图像大小 img_size 和数据所在文件夹 folder，
+    返回处理后的 torch.utils.data.Dataset 和数据集类别数。
+    """
     transform = tv.transforms.Compose(
         [
             tv.transforms.Resize(img_size),

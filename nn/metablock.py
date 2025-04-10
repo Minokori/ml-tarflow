@@ -271,7 +271,7 @@ class MetaBlock(torch.nn.Module):
 
         # 计算注意力, 相当于得到 $$ f(x) $$
         for block in self.attn_blocks:
-            x_i = block(x_i, attn_temp=tau, which_cache=which_cache)  # here we use kv caching, so no attn_mask
+            x_i = block(x_i, tau=tau, which_cache=which_cache)  # here we use kv caching, so no attn_mask
             # region NOTE key, value 缓存的作用
             # 由于每次只计算一行 x_i, k,v中保存了前i行的 k,v,和 mask效果相同
             # endregion
@@ -336,6 +336,9 @@ class MetaBlock(torch.nn.Module):
 
             # 计算条件引导下的逆运算
             z_alpha_cond, z_mu_cond = self.reverse_step(x, pos_embed, i, y, which_cache='cond')  # shape: (B,1,C_hidden)
+
+            z_alpha = z_alpha_cond
+            z_mu = z_mu_cond
 
             # 计算非条件引导下的逆运算
             if guidance > 0 and guide_what:

@@ -1,3 +1,4 @@
+"""TarFlow模型"""
 #
 # For licensing see accompanying LICENSE file.
 # Copyright (C) 2024 Apple Inc. All Rights Reserved.
@@ -24,6 +25,7 @@ from nn.metablock import MetaBlock
 # C_hidden: 隐藏层通道数
 
 class Model(torch.nn.Module):
+    """TarFlow模型"""
     VAR_LR: float = 0.1
     """更新先验分布时的学习率"""
     var: torch.Tensor
@@ -66,7 +68,7 @@ class Model(torch.nn.Module):
 
         Args:
             in_channels (int): 输入张量(图片)的通道数 C
-            
+
             img_size (int): 输入图像的边长 W
             patch_size (int): 图像分块的边长 P
             channels (int): MetaBlock 中的隐藏层通道数 C_hidden
