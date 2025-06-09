@@ -1,4 +1,5 @@
-#
+# pyright: ignore
+# pyright: ignore[reportGeneralTypeIssues, reportMissingImports]
 # For licensing see accompanying LICENSE file.
 # Copyright (C) 2024 Apple Inc. All Rights Reserved.
 #
@@ -13,6 +14,7 @@ import torchvision as tv
 
 import transformer_flow
 import utils
+from config import TarflowConfig
 
 
 def main(args):
@@ -34,16 +36,18 @@ def main(args):
     fid.load_state_dict(torch.load(fid_stats_file, map_location='cpu', weights_only=False))
     dist.barrier()
 
+    config = TarflowConfig(channels_in=args.channel_size,
+                           img_size=args.img_size,
+                           patch_size=args.patch_size,
+                           channels_hidden=args.channels,
+                           blocks_num=args.blocks,
+                           layers_per_block=args.layers_per_block,
+                           nvp=args.nvp,
+                           num_classes=num_classes,
+                           )
     model = transformer_flow.Model(
-        in_channels=args.channel_size,
-        img_size=args.img_size,
-        patch_size=args.patch_size,
-        channels=args.channels,
-        num_blocks=args.blocks,
-        layers_per_block=args.layers_per_block,
-        nvp=args.nvp,
-        num_classes=num_classes,
-    ).cuda()
+        config
+    ).to('cuda')
     for p in model.parameters():
         p.requires_grad = False
 

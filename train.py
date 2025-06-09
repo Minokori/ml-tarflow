@@ -14,6 +14,7 @@ import torchvision as tv
 
 import transformer_flow
 import utils
+from config import TarflowConfig
 
 
 def main(args):
@@ -56,16 +57,17 @@ def main(args):
         pin_memory=True,
         drop_last=True,
     )
-
+    config = TarflowConfig(channels_in=args.channel_size,
+                           img_size=args.img_size,
+                           patch_size=args.patch_size,
+                           channels_hidden=args.channels,
+                           blocks_num=args.blocks,
+                           layers_per_block=args.layers_per_block,
+                           nvp=args.nvp,
+                           num_classes=num_classes,
+                           )
     model = transformer_flow.Model(
-        in_channels=args.channel_size,
-        img_size=args.img_size,
-        patch_size=args.patch_size,
-        channels=args.channels,
-        num_blocks=args.blocks,
-        layers_per_block=args.layers_per_block,
-        nvp=args.nvp,
-        num_classes=num_classes,
+        config
     ).to('cuda')
     optimizer = torch.optim.AdamW(model.parameters(), betas=(0.9, 0.95), lr=args.lr, weight_decay=1e-4)
     lr_schedule = utils.CosineLRSchedule(optimizer, len(data_loader), args.epochs * len(data_loader), 1e-6, args.lr)

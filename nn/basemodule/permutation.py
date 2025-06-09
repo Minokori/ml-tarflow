@@ -4,7 +4,7 @@
 以便不同特征均能参与到耦合层的计算.
 """
 from abc import ABC, abstractmethod
-from typing import TYPE_CHECKING, overload
+from typing import TYPE_CHECKING
 
 import torch
 
@@ -21,7 +21,6 @@ class Permutation(ABC, torch.nn.Module):
         继承该类请重载 `forward()` 方法
     """
     if TYPE_CHECKING:
-        @overload
         def __call__(self, x: torch.Tensor, dim: int = 1, inverse: bool = False) -> torch.Tensor:
             r"""对输入张量 `x` 进行置换操作
 
@@ -59,7 +58,6 @@ class PermutationIdentity(Permutation):
     """
 
     if TYPE_CHECKING:
-        @overload
         def __call__(self, x, dim: int = 1, inverse: bool = False) -> torch.Tensor:
             r"""对输入张量不做任何操作.
 
@@ -85,7 +83,6 @@ class PermutationFlip(Permutation):
     $$ output_{(B,[1:l],C)} = input_{(B,[l:1],C)} $$
     """
     if TYPE_CHECKING:
-        @overload
         def __call__(self, x: torch.Tensor, dim: int = 1, inverse: bool = False) -> torch.Tensor:
             """将输入张量 x 维度 dim 内的元素进行翻转
 

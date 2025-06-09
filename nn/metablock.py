@@ -1,8 +1,9 @@
 """TarFlow 的 MetaBlock 模块. TarFlow的核心架构为多个 MetaBlock串联"""
-from typing import TYPE_CHECKING, Literal, overload
+from typing import TYPE_CHECKING, Literal
 
 import torch
 
+from config import MetaBlockConfig
 from nn.basemodule import *
 from nn.blockmodule import *
 
@@ -17,17 +18,11 @@ from nn.blockmodule import *
 # C_hidden: 隐藏层通道数
 
 class MetaBlock(torch.nn.Module):
-    attn_mask: torch.Tensor
-    """注意力 mask, 下三角全为1的矩阵, 用于屏蔽未来的信息
-
-    shape: (L, L)
-    """
+    # attn_mask
     # region TYPR_CHECKING
     if TYPE_CHECKING:
-
-        @overload
         def proj_in(self, x: torch.Tensor) -> torch.Tensor:
-            """线性投影层(in).
+            r"""线性投影层(in).
 
             将输入的通道映射到计算注意力时的通道
 
@@ -41,9 +36,8 @@ class MetaBlock(torch.nn.Module):
             """
             ...
 
-        @overload
         def proj_out(self, x: torch.Tensor) -> torch.Tensor:
-            """线性投影层(out).
+            r"""线性投影层(out).
 
             将计算注意力时的通道映射到输出的通道, 输出的通道数为 `C * (1 + nvp)`
 
@@ -57,7 +51,6 @@ class MetaBlock(torch.nn.Module):
             """
             ...
 
-        @overload
         def __call__(self, x: torch.Tensor, logdet: torch.Tensor | None = None) -> tuple[torch.Tensor, torch.Tensor]:
             """前向传播
 
@@ -69,41 +62,30 @@ class MetaBlock(torch.nn.Module):
                 tuple[torch.Tensor, torch.Tensor]: 输出张量, shape: (B, L, C), 本层雅可比行列式的 log 值, shape: (B)
             """
             ...
+
+        @property
+        def attn_mask(self) -> torch.Tensor:
+            """注意力 mask, 下三角全为1的矩阵, 用于屏蔽未来的信息
+
+            shape: (L, L)
+            """
+            ...
     # endregion
 
-    def __init__(
-        self,
-        in_channels: int,
-        channels: int,
-        num_patches: int,
-        permutation: Permutation,
-        num_layers: int = 1,
-        head_dim: int = 64,
-        expansion: int = 4,
-        nvp: bool = True,
-        num_classes: int = 0,
-    ):
-        """初始化
-
-        Args:
-            in_channels (int): 输入张量的通道数, 记作 `C`
-            channels (int): 隐藏层通道数, 记作 `C_hidden`
-            num_patches (int): 图像被分割成的块数, 也即序列长度 `L`
-            permutation (Permutation): 置换类型.
-            num_layers (int, optional): 注意力块数. Defaults to 1.
-            head_dim (int, optional): 每个注意力头分配的通道数. Defaults to 64.
-            expansion (int, optional): MLP的隐藏层扩大系数. Defaults to 4.
-            nvp (bool, optional): 是否使用 `NVP` 模式. Defaults to True.
-            num_classes (int, optional): 样本类别数, 设置为 0 即为没有类别 Defaults to 0.
-        """
+    def __init__(self, config: MetaBlockConfig, permutation: Permutation):
+        self._config = config
         super().__init__()
-        self.proj_in = torch.nn.Linear(in_channels, channels)
-        self.pos_embed = torch.nn.Parameter(torch.randn(num_patches, channels) * 1e-2)
+        self.proj_in = torch.nn.Linear(self._config.channels_in, self._config.channels_hidden)
+        self.pos_embed = torch.nn.Parameter(torch.randn(self._config.num_patches, self._config.channels_hidden) * 1e-2)
         """位置嵌入编码使用的矩阵(可学习参数).
 
         `shape: (L, C_hidden)` """
-
-        self.class_embed = torch.nn.Parameter(torch.randn(num_classes, 1, channels) * 1e-2) if num_classes else None
+        self.class_embed = torch.nn.Parameter(
+            torch.randn(
+                self._config.num_classes,
+                1,
+                self._config.channels_hidden) *
+            1e-2) if self._config.num_classes else None
         """类别嵌入编码使用的矩阵(可学习参数).
 
         初始化时, 若`num_classes > 0`, 该参数用于存储每个类别的嵌入编码. 否则为 `None`.
@@ -111,21 +93,18 @@ class MetaBlock(torch.nn.Module):
         `shape: (num_classes, 1, C_hidden)`
         """
         self.attn_blocks: list[AttentionBlock] = torch.nn.ModuleList(
-            [AttentionBlock(channels, head_dim, expansion)
-             for _ in range(num_layers)])
-        self.nvp = nvp
-        """是否使用 `NVP (non-volume preserving)`, 非体积保持模式.
-
-        非体积保持启用时, logdet 不为1
-        """
-
-        self.proj_out = torch.nn.Linear(channels, in_channels * (1 + nvp))
+            [AttentionBlock(self._config.AttentionBlockConfig)
+             for _ in range(self._config.num_layers)])  # type: ignore
+        self.proj_out = torch.nn.Linear(self._config.channels_hidden, self._config.channels_in * (1 + self._config.nvp))
         self.proj_out.weight.data.fill_(0.0)
-
         self.permutation: Permutation = permutation
         """置换操作块."""
-
-        self.register_buffer('attn_mask', torch.tril(torch.ones(num_patches, num_patches)))  # 注意力 mask, 下三角全为1的矩阵, 用于屏蔽未来的信息
+        self.register_buffer(
+            'attn_mask',
+            torch.tril(
+                torch.ones(
+                    self._config.num_patches,
+                    self._config.num_patches)))  # 注意力 mask, 下三角全为1的矩阵, 用于屏蔽未来的信息
 
     def forward(self, x: torch.Tensor, y: torch.Tensor | None = None) -> tuple[torch.Tensor, torch.Tensor]:
         """前向传播
@@ -135,7 +114,7 @@ class MetaBlock(torch.nn.Module):
             y (torch.Tensor | None, optional): 输入张量的标签, shape:(B). Defaults to None.
 
         Returns:
-            tuple[torch.Tensor, torch.Tensor]: 输出张量, shape: (B, L, C), 本层雅可比行列式的 log 值, shape: (B)
+            output,logdet (tuple[torch.Tensor, torch.Tensor]): 输出张量, shape: (B, L, C), 本层雅可比行列式的 log 值, shape: (B)
         """
         # 置换操作, 在原论文内由 $$ \pi(z) $$ 表示
         x = self.permutation(x)  # shape: (B, L, C)
@@ -145,7 +124,7 @@ class MetaBlock(torch.nn.Module):
 
         # 位置嵌入编码
         pos_embed = self.permutation(self.pos_embed, dim=0)  # shape: (L, C_hidden)
-        x = self.proj_in(x) + pos_embed  # shape: (B,L,C_hidden)
+        x = self.proj_in(x) + pos_embed  # shape: (B, L, C_hidden)
 
         # classifier guidance 和 classifier free guidance
         if self.class_embed is not None:  # 有分类引导
@@ -232,7 +211,85 @@ class MetaBlock(torch.nn.Module):
 
         return self.permutation((x_hat - x_mu) * scale, inverse=True), logdet
 
-    def reverse_step(
+    def reverse(
+        self,
+        x: torch.Tensor,
+        y: torch.Tensor | None = None,
+        guidance: float = 0,
+        guide_what: str = 'ab',
+        tau: float = 1.0,
+        annealed_guidance: bool = False,
+    ) -> torch.Tensor:
+        """_summary_
+
+        Args:
+            x (torch.Tensor): 输入张量(序列), shape: (B, L, C)
+            y (torch.Tensor | None, optional): 输入张量对应的标签, shape:(B) Defaults to None.
+            guidance (float, optional): 引导权重 w. Defaults to 0.
+            guide_what (str, optional): _description_. Defaults to 'ab'.
+            tau (float, optional): 手动注入温度项. Defaults to 1.0.
+            annealed_guidance (bool, optional): 是否使用退火引导权重 (使固定的 w 变成动态的 w(i,L) ). Defaults to False.
+
+        Returns:
+            torch.Tensor: 输出张量(序列), shape: (B,L,C)
+        """
+
+        # 置换操作, 在原论文内由 $$ \pi^{-1}(z) $$ 表示
+        x = self.permutation(x)  # shape: (B, L, C)
+        pos_embed = self.permutation(self.pos_embed, dim=0)  # shape: (L, C_hidden)
+        self._set_sample_mode(True)
+        L = x.size(1)
+        for i in range(L - 1):  # x按行计算,每行为 (B,1,C_hidden). 注意 共有L-1个元素, 这是由于 x_l-1 不需要变更
+
+            # 计算条件引导下的逆运算
+            z_alpha_cond, z_mu_cond = self._reverse_step(x, pos_embed, i, y, which_cache='cond')  # shape: (B,1,C_hidden)
+
+            z_alpha = z_alpha_cond
+            z_mu = z_mu_cond
+
+            # 计算非条件引导下的逆运算
+            if guidance > 0 and guide_what:
+                z_alpha_uncond, z_mu_uncond = self._reverse_step(x, pos_embed, i, None, tau=tau, which_cache='uncond')
+
+                # 确定引导权重 w_i
+                if annealed_guidance:
+                    w_i = (i + 1) / (L - 1) * guidance
+                    # region NOTE
+                    # 在原论文公式(11)后, 为:
+                    #
+                    # $$ w_i = \frac{i+1}{L-1}w $$
+                    #
+                    # endregion
+                else:
+                    w_i = guidance
+
+                # 非条件引导
+                if 'a' in guide_what:
+                    z_alpha = z_alpha_cond + w_i * (z_alpha_cond - z_alpha_uncond)
+                if 'b' in guide_what:
+                    z_mu = z_mu_cond + w_i * (z_mu_cond - z_mu_uncond)
+                # shape: (B,1,C_hidden)
+                # region NOTE
+                # 对应原论文公式(11):
+                r"""
+                $$
+                \begin{eqnarray}
+                \hspace{8em}\alpha_i(z_{<i};\tau,w) &=& (1+w) \alpha_i(z_{<i};1) - w\alpha_i(z_{<i},\tau)\\
+                \hspace{8em}\mu_i(z_{<i};\tau,w) &=& (1+w) \mu_i(z_{<i};1) - w\mu_i(z_{<i},\tau)
+                \end{eqnarray}
+                $$
+                """
+                # endregion
+
+            # BUG exp 后可能会导致溢出, 使计算变为 NaN
+            scale = z_alpha[:, 0].float().exp().type(z_alpha.dtype)  # shape: (B,C_hidden)
+
+            # 上面计算的是第 i 行的逆运算, 替换原来的第 i 行
+            x[:, i + 1] = x[:, i + 1] * scale + z_mu[:, 0]
+        self._set_sample_mode(False)
+        return self.permutation(x, inverse=True)
+
+    def _reverse_step(
         self,
         x: torch.Tensor,
         pos_embed: torch.Tensor,
@@ -256,8 +313,10 @@ class MetaBlock(torch.nn.Module):
         """
 
         # 获得序列的第 i 个元素, i<=0<L
-        x_i = x[:, i: i + 1]  # shape: (B,1,C).
         # 注意, 使用 x_i[:,i]会使形状变为 (B,C), 这里需要保留维度
+        x_i = x[:, i: i + 1]  # shape: (B,1,C).
+
+        # 位置投影
         x_i = self.proj_in(x_i) + pos_embed[i: i + 1]  # shape: (B, 1, C_hidden)
 
         # 类型引导
@@ -290,7 +349,7 @@ class MetaBlock(torch.nn.Module):
         # endregion
         return x_alpha, x_mu
 
-    def set_sample_mode(self, flag: bool = True):
+    def _set_sample_mode(self, flag: bool = True):
         """设置是否为采样(逆运算)模式
 
         清空 Attention 块内的 k, v矩阵的缓存.
@@ -301,82 +360,3 @@ class MetaBlock(torch.nn.Module):
         for m in self.modules():
             if isinstance(m, Attention):
                 m.sample = flag
-                m.k_cache = {'cond': [], 'uncond': []}
-                m.v_cache = {'cond': [], 'uncond': []}
-
-    def reverse(
-        self,
-        x: torch.Tensor,
-        y: torch.Tensor | None = None,
-        guidance: float = 0,
-        guide_what: str = 'ab',
-        tau: float = 1.0,
-        annealed_guidance: bool = False,
-    ) -> torch.Tensor:
-        """_summary_
-
-        Args:
-            x (torch.Tensor): 输入张量(序列), shape: (B, L, C)
-            y (torch.Tensor | None, optional): 输入张量对应的标签, shape:(B) Defaults to None.
-            guidance (float, optional): 引导权重 w. Defaults to 0.
-            guide_what (str, optional): _description_. Defaults to 'ab'.
-            tau (float, optional): 手动注入温度项. Defaults to 1.0.
-            annealed_guidance (bool, optional): 是否使用退火引导权重 (使固定的 w 变成动态的 w(i,L) ). Defaults to False.
-
-        Returns:
-            torch.Tensor: 输出张量(序列), shape: (B,L,C)
-        """
-
-        # 置换操作, 在原论文内由 $$ \pi^{-1}(z) $$ 表示
-        x = self.permutation(x)  # shape: (B, L, C)
-        pos_embed = self.permutation(self.pos_embed, dim=0)  # shape: (L, C_hidden)
-        self.set_sample_mode(True)
-        L = x.size(1)
-        for i in range(L - 1):  # x按行计算,每行为 (B,1,C_hidden). 注意 共有L-1个元素, 这是由于 x_l-1 不需要变更
-
-            # 计算条件引导下的逆运算
-            z_alpha_cond, z_mu_cond = self.reverse_step(x, pos_embed, i, y, which_cache='cond')  # shape: (B,1,C_hidden)
-
-            z_alpha = z_alpha_cond
-            z_mu = z_mu_cond
-
-            # 计算非条件引导下的逆运算
-            if guidance > 0 and guide_what:
-                z_alpha_uncond, z_mu_uncond = self.reverse_step(x, pos_embed, i, None, tau=tau, which_cache='uncond')
-
-                # 确定引导权重 w_i
-                if annealed_guidance:
-                    w_i = (i + 1) / (L - 1) * guidance
-                    # region NOTE
-                    # 在原论文公式(11)后, 为:
-                    #
-                    # $$ w_i = \frac{i+1}{L-1}w $$
-                    #
-                    # endregion
-                else:
-                    w_i = guidance
-
-                # 非条件引导
-                if 'a' in guide_what:
-                    z_alpha = z_alpha_cond + w_i * (z_alpha_cond - z_alpha_uncond)
-                if 'b' in guide_what:
-                    z_mu = z_mu_cond + w_i * (z_mu_cond - z_mu_uncond)
-                # shape: (B,1,C_hidden)
-                # region NOTE
-                # 对应原论文公式(11):
-                r"""
-                $$
-                \begin{eqnarray}
-                \hspace{8em}\alpha_i(z_{<i};\tau,w) &=& (1+w) \alpha_i(z_{<i};1) - w\alpha_i(z_{<i},\tau)\\
-                \hspace{8em}\mu_i(z_{<i};\tau,w) &=& (1+w) \mu_i(z_{<i};1) - w\mu_i(z_{<i},\tau)
-                \end{eqnarray}
-                $$
-                """
-                # endregion
-
-            scale = z_alpha[:, 0].float().exp().type(z_alpha.dtype)  # shape: (B,C_hidden)
-
-            # 上面计算的是第 i 行的逆运算, 替换原来的第 i 行
-            x[:, i + 1] = x[:, i + 1] * scale + z_mu[:, 0]
-        self.set_sample_mode(False)
-        return self.permutation(x, inverse=True)

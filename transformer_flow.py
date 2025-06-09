@@ -3,10 +3,11 @@
 # For licensing see accompanying LICENSE file.
 # Copyright (C) 2024 Apple Inc. All Rights Reserved.
 #
-from typing import TYPE_CHECKING, overload
+from typing import TYPE_CHECKING
 
 import torch
 
+from config import TarflowConfig
 from nn.basemodule import *
 from nn.blockmodule import *
 from nn.metablock import MetaBlock
@@ -26,18 +27,11 @@ from nn.metablock import MetaBlock
 
 class Model(torch.nn.Module):
     """TarFlow模型"""
+
     VAR_LR: float = 0.1
     """更新先验分布时的学习率"""
-    var: torch.Tensor
-    """先验分布.
-
-    `NVP` 模式下的 全为1的矩阵, 但 `VP` 模式下是可学习的参数
-
-    `shape:(L,C * P * P)`
-    """
 
     if TYPE_CHECKING:
-        @overload
         def __call__(self,
                      x: torch.Tensor,
                      y: torch.Tensor | None = None
@@ -49,65 +43,37 @@ class Model(torch.nn.Module):
                 y (torch.Tensor | None, optional): 输入张量的标签, shape: (B). Defaults to None.
 
             Returns:
-                tuple[torch.Tensor, list[torch.Tensor], torch.Tensor]: 输出 (B, L, C*P*P), 每层的输出 , logdets (B,)
+                output,perlayeroutput,logdets (tuple[torch.Tensor, list[torch.Tensor], torch.Tensor]): 输出 (B, L, C*P*P), 每层的输出 , logdets (B,)
             """
             ...
 
-    def __init__(
-        self,
-        in_channels: int,
-        img_size: int,
-        patch_size: int,
-        channels: int,
-        num_blocks: int,
-        layers_per_block: int,
-        nvp: bool = True,
-        num_classes: int = 0,
-    ):
-        """初始化模型
+        @property
+        def var(self) -> torch.Tensor:
+            """先验分布
 
-        Args:
-            in_channels (int): 输入张量(图片)的通道数 C
+            `NVP` 模式下的 全为1的矩阵, 但 `VP` 模式下是可学习的参数
 
-            img_size (int): 输入图像的边长 W
-            patch_size (int): 图像分块的边长 P
-            channels (int): MetaBlock 中的隐藏层通道数 C_hidden
-            num_blocks (int): MetaBlock 的数量
-            layers_per_block (int): MetaBlock 中的层数
-            nvp (bool, optional): 是否使用 `NVP` 模式. Defaults to True.
-            num_classes (int, optional): 分类数量, 用于引导网络训练. Defaults to 0.
-        """
+            `shape:(L,C * P * P)`
+            """
+            ...
+
+    def __init__(self, config: TarflowConfig):
         super().__init__()
-        self.img_size = img_size
-        """输入图像的边长, 记为 `W`"""
-        self.patch_size = patch_size
-        """图像块的边长,记为 `P`"""
-        self.num_patches = (img_size // patch_size) ** 2
-        """图像被分割成的块数,记为L
+        self._config = config
 
-        由于每一块被当成序列的一个元素, 故使用 `L` 表示, L = (W/P)^2
-        """
-        permutations: list[Permutation] = [PermutationIdentity(self.num_patches), PermutationFlip(self.num_patches)]
-        """置换块, 一个单位置换块,一个翻转置换块"""
-
-        # 初始化 MetaBlock 块
+        self.permutations: list[Permutation] = [PermutationIdentity(config.num_patches), PermutationFlip(config.num_patches)]
         blocks = []
-        for i in range(num_blocks):
+        for i in range(config.blocks_num):
             blocks.append(
                 MetaBlock(
-                    in_channels * patch_size**2,
-                    channels,
-                    self.num_patches,
-                    permutations[i % 2],
-                    layers_per_block,
-                    nvp=nvp,
-                    num_classes=num_classes,
+                    config.MetaBlockConfig,
+                    permutation=self.permutations[i % 2],
                 )
             )
-        self.blocks: list[MetaBlock] = torch.nn.ModuleList(blocks)
-        """Meta Block"""
-        # prior for nvp mode should be all ones, but needs to be learnd for the vp mode
-        self.register_buffer('var', torch.ones(self.num_patches, in_channels * patch_size**2))
+        self.blocks: list[MetaBlock] = torch.nn.ModuleList(blocks)  # type: ignore
+        self.register_buffer('var', torch.ones(self._config.num_patches, self._config.channels_patched))
+        pass
+
 
     def patchify(self, x: torch.Tensor) -> torch.Tensor:
         r"""将输入的图片张量转为块序列张量
@@ -120,7 +86,7 @@ class Model(torch.nn.Module):
         Returns:
             torch.Tensor: 块序列张量, shape: (B, L, C*P*P)
         """
-        u = torch.nn.functional.unfold(x, self.patch_size, stride=self.patch_size)  # shape: (B, C_img, L)
+        u = torch.nn.functional.unfold(x, self._config.patch_size, stride=self._config.patch_size)  # shape: (B, C_img, L)
         return u.transpose(1, 2)
 
     def unpatchify(self, x: torch.Tensor) -> torch.Tensor:
@@ -135,7 +101,7 @@ class Model(torch.nn.Module):
             torch.Tensor: 图片张量, shape: (B, C, W, W)
         """
         u = x.transpose(1, 2)  # shape: (B, C*P*P, L)
-        return torch.nn.functional.fold(u, (self.img_size, self.img_size), self.patch_size, stride=self.patch_size)
+        return torch.nn.functional.fold(u, (self._config.img_size, self._config.img_size), self._config.patch_size, stride=self._config.patch_size)
 
     def forward(
         self,

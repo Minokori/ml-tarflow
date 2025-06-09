@@ -1,6 +1,8 @@
 """注意力模块"""
-from typing import TYPE_CHECKING, Literal, overload
+from functools import cached_property
+from typing import TYPE_CHECKING, Literal
 
+from config import AttentionConfig
 import torch
 
 
@@ -13,13 +15,11 @@ import torch
 # H * D =C
 
 class Attention(torch.nn.Module):
-    """注意力模块
-    """
+    """注意力模块"""
     USE_SDPA: bool = True
     """是否使用 `Scaled Dot-Product Attention(SDPA)`, 点积注意力机制"""
 
     if TYPE_CHECKING:
-        @overload
         def __call__(self,
                      x: torch.Tensor,
                      mask: torch.Tensor | None = None,
@@ -40,7 +40,6 @@ class Attention(torch.nn.Module):
             """
             ...
 
-        @overload
         def norm(self, x: torch.Tensor) -> torch.Tensor:
             """层归一化(针对单个样本的不同特征进行归一化)
 
@@ -52,7 +51,6 @@ class Attention(torch.nn.Module):
             """
             ...
 
-        @overload
         def qkv(self, x: torch.Tensor) -> torch.Tensor:
             """计算 Query, Key, Value 的权重矩阵
 
@@ -63,7 +61,6 @@ class Attention(torch.nn.Module):
             """
             ...
 
-        @overload
         def proj(self, x: torch.Tensor) -> torch.Tensor:
             """投影
 
@@ -75,34 +72,50 @@ class Attention(torch.nn.Module):
             """
             ...
 
-    def __init__(self, in_channels: int, head_channels: int):
+    def __init__(self, config:AttentionConfig):
         """初始化
 
         Args:
-            in_channels (int): 输入的维度 C
-            head_channels (int): 为每个注意力头分配的维度 D
+            channels_in (int): 输入的维度 C
+            channels_per_head (int): 每个注意力头分配的维度 D
         """
-        assert in_channels % head_channels == 0  # 确保输入维度能被注意力头数整除
+        self._config = config
         super().__init__()
-        self.norm = torch.nn.LayerNorm(in_channels)
+        self.norm = torch.nn.LayerNorm(self._config.channels_in)
         """层归一化(针对单个样本的不同特征进行归一化)"""
-        self.qkv = torch.nn.Linear(in_channels, in_channels * 3)
+        self.qkv = torch.nn.Linear(self._config.channels_in, self._config.channels_in * 3)
         """Query, Key, Value 矩阵的权重"""
-        self.proj = torch.nn.Linear(in_channels, in_channels)
+        self.proj = torch.nn.Linear(self._config.channels_in, self._config.channels_in)
         """投影"""
-        self.num_heads = in_channels // head_channels
-        """注意力头数H"""
-        self.sqrt_scale = head_channels ** (-0.25)
-        """每个注意力头的缩放点积注意力的缩放因子的平方根"""
-        self.sample = False
-        """是否为采样(逆运算)模式"""
-        self.k_cache: dict[str, list[torch.Tensor]] = {'cond': [], 'uncond': []}
-        """K矩阵的缓存"""
-        self.v_cache: dict[str, list[torch.Tensor]] = {'cond': [], 'uncond': []}
-        """V矩阵的缓存"""
 
-    def forward_sdpa(
-        self, x: torch.Tensor, mask: torch.Tensor | None = None, tau: float = 1.0, which_cache: str = 'cond'
+        self._sample = False
+        """是否为采样(逆运算)模式"""
+        self._k_cache: dict[str, list[torch.Tensor]] = {'cond': [], 'uncond': []}
+        """K矩阵的缓存. 仅在逆运算时使用"""
+        self._v_cache: dict[str, list[torch.Tensor]] = {'cond': [], 'uncond': []}
+        """V矩阵的缓存, 仅在逆运算时使用"""
+
+    @property
+    def sample(self) -> bool:
+        """是否为采样(逆运算)模式
+
+        改变该属性会清空 K 和 V 的缓存
+        """
+        return self._sample
+
+    @sample.setter
+    def sample(self, value: bool):
+        self._sample = value
+        self._k_cache = {'cond': [], 'uncond': []}
+        self._v_cache = {'cond': [], 'uncond': []}
+
+    @cached_property
+    def _sqrt_scale(self) -> float:
+        """计算每个注意力头的缩放点积注意力的缩放因子的平方根"""
+        return self._config.channels_per_head ** (-0.25)
+
+    def _forward_sdpa(
+        self, x: torch.Tensor, mask: torch.Tensor | None = None, tau: float = 1.0, which_cache: Literal["cond", "uncond"] = 'cond'
     ) -> torch.Tensor:
         """使用点积注意力机制(SDPA)进行前向传播
 
@@ -123,7 +136,7 @@ class Attention(torch.nn.Module):
         x = self.norm(x.float()).type(x.dtype)
 
         # 计算 Q, K, V 矩阵
-        q, k, v = self.qkv(x).reshape(B, L, 3 * self.num_heads, -1).transpose(1, 2).chunk(3, dim=1)  # (b, h, l, d)
+        q, k, v = self.qkv(x).reshape(B, L, 3 * self._config.num_heads, -1).transpose(1, 2).chunk(3, dim=1)  # (b, h, l, d)
         # x -> qkv       shape: (b, l, 3 * c)
         #   -> reshape   shape: (b, l, 3 * h, d), h = num_heads, d = head_dim, h * d = c
         #   -> transpose shape: (b, 3 * h, l, d)
@@ -131,11 +144,11 @@ class Attention(torch.nn.Module):
 
         # 逆运算时,计算 attention 时的 mask 为空, 使用缓存的kv矩阵计算
         if self.sample:
-            self.k_cache[which_cache].append(k)
-            self.v_cache[which_cache].append(v)
+            self._k_cache[which_cache].append(k)
+            self._v_cache[which_cache].append(v)
             # shape: (i+1) * (B,h,1,d)
-            k = torch.cat(self.k_cache[which_cache], dim=2)
-            v = torch.cat(self.v_cache[which_cache], dim=2)
+            k = torch.cat(self._k_cache[which_cache], dim=2)
+            v = torch.cat(self._v_cache[which_cache], dim=2)
             # shape: (b, h, i+1, d)
             # region NOTE
             # k 缓存和 v 缓存在逆运算之前清空, 逆运算是对输入x(B, L, C) 按行计算
@@ -146,7 +159,7 @@ class Attention(torch.nn.Module):
             # endregion
 
         # 计算缩放因子 $$ d_k $$
-        scale = self.sqrt_scale**2 / tau
+        scale = self._sqrt_scale**2 / tau
         # region NOTE
         # 该操作在原论文(11)式前描述, 将 attention 的 log 除以 tau
         # endregion
@@ -166,19 +179,19 @@ class Attention(torch.nn.Module):
         x = self.proj(x)  # shape: (b, l, c)
         return x
 
-    def forward_base(
+    def _forward_base(
         self, x: torch.Tensor, mask: torch.Tensor | None = None, temp: float = 1.0, which_cache: str = 'cond'
     ) -> torch.Tensor:
         B, T, C = x.size()
         x = self.norm(x.float()).type(x.dtype)
-        q, k, v = self.qkv(x).reshape(B, T, 3 * self.num_heads, -1).chunk(3, dim=2)
+        q, k, v = self.qkv(x).reshape(B, T, 3 * self._config.num_heads, -1).chunk(3, dim=2)
         if self.sample:
-            self.k_cache[which_cache].append(k)
-            self.v_cache[which_cache].append(v)
-            k = torch.cat(self.k_cache[which_cache], dim=1)
-            v = torch.cat(self.v_cache[which_cache], dim=1)
+            self._k_cache[which_cache].append(k)
+            self._v_cache[which_cache].append(v)
+            k = torch.cat(self._k_cache[which_cache], dim=1)
+            v = torch.cat(self._v_cache[which_cache], dim=1)
 
-        attn = torch.einsum('bmhd,bnhd->bmnh', q * self.sqrt_scale, k * self.sqrt_scale) / temp
+        attn = torch.einsum('bmhd,bnhd->bmnh', q * self._sqrt_scale, k * self._sqrt_scale) / temp
         if mask is not None:
             attn = attn.masked_fill(mask.unsqueeze(-1) == 0, float('-inf'))
         attn = attn.float().softmax(dim=-2).type(attn.dtype)
@@ -188,8 +201,8 @@ class Attention(torch.nn.Module):
         return x
 
     def forward(
-        self, x: torch.Tensor, mask: torch.Tensor | None = None, tau: float = 1.0, which_cache: str = 'cond'
+        self, x: torch.Tensor, mask: torch.Tensor | None = None, tau: float = 1.0, which_cache: Literal["cond", "uncond"] = 'cond'
     ) -> torch.Tensor:
         if self.USE_SDPA:
-            return self.forward_sdpa(x, mask, tau, which_cache)
-        return self.forward_base(x, mask, tau, which_cache)
+            return self._forward_sdpa(x, mask, tau, which_cache)
+        return self._forward_base(x, mask, tau, which_cache)

@@ -2,10 +2,12 @@ import argparse
 import os
 import pathlib
 
+from config import TarflowConfig
 import numpy as np
 import torch
 import torch.utils.data
 import torchvision as tv
+
 import transformer_flow
 
 
@@ -39,16 +41,16 @@ def main(args):
     )
 
     device = torch.device("cuda")
-    model = transformer_flow.Model(
-        in_channels=args.channel_size,
-        img_size=args.img_size,
-        patch_size=args.patch_size,
-        channels=args.channels,
-        num_blocks=args.blocks,
-        layers_per_block=args.layers_per_block,
-        nvp=args.nvp,
-        num_classes=args.num_classes,
-    ).to(device)
+    config = TarflowConfig(channels_in=args.channel_size,
+                           img_size=args.img_size,
+                           patch_size=args.patch_size,
+                           channels_hidden=args.channels,
+                           blocks_num=args.blocks,
+                           layers_per_block=args.layers_per_block,
+                           nvp=args.nvp,
+                           num_classes=args.num_classes,
+                           )
+    model = transformer_flow.Model(config)
 
     ckpt_file = args.ckpt_file
     ckpt = torch.load(ckpt_file, map_location="cpu")

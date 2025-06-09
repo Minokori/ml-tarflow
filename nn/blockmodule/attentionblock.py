@@ -1,6 +1,7 @@
 """残差注意力块 (一个注意力机制模块 + 一个全连接层, 串联)"""
-from typing import TYPE_CHECKING, Literal, overload
+from typing import TYPE_CHECKING, Literal
 
+from config import AttentionBlockConfig
 import torch
 
 from nn.basemodule import *
@@ -23,7 +24,6 @@ class AttentionBlock(torch.nn.Module):
     """
 
     if TYPE_CHECKING:
-        @overload
         def __call__(self, x: torch.Tensor, attn_mask: torch.Tensor | None = None, tau: float = 1.0,
                      which_cache: Literal["cond", "uncond"] = 'cond') -> torch.Tensor:
             """前向传播
@@ -37,23 +37,18 @@ class AttentionBlock(torch.nn.Module):
             Returns:
                 torch.Tensor: 输出张量, shape: (B, L, C)
             """
+            ...
 
-    def __init__(self, channels: int, head_channels: int, expansion: int = 4):
-        """初始化
-
-        Args:
-            channels (int): 输入张量的通道数 C
-            head_channels (int): 注意力头数 H ,注意需要 `C//H = 0`
-            expansion (int, optional): 扩大系数, MLP 的隐藏层维度 = C * expansion. Defaults to 4.
-        """
+    def __init__(self, config:AttentionBlockConfig):
+        """初始化"""
+        self._config = config
         super().__init__()
-        self.attention = Attention(channels, head_channels)
+        self.attention = Attention(self._config.AttentionConfig)
         """注意力块"""
-        self.mlp = MLP(channels, expansion)
+        self.mlp = MLP(self._config.MLPConfig)
         """MLP 块"""
-
     def forward(
-        self, x: torch.Tensor, attn_mask: torch.Tensor | None = None, tau: float = 1.0, which_cache: str = 'cond'
+        self, x: torch.Tensor, attn_mask: torch.Tensor | None = None, tau: float = 1.0, which_cache: Literal["cond", "uncond"] = 'cond'
     ) -> torch.Tensor:
         x = x + self.attention(x, attn_mask, tau, which_cache)
         x = x + self.mlp(x)
