@@ -51,7 +51,7 @@ class MetaBlock(torch.nn.Module):
             """
             ...
 
-        def __call__(self, x: torch.Tensor, logdet: torch.Tensor | None = None) -> tuple[torch.Tensor, torch.Tensor]:
+        def __call__(self, x: torch.Tensor, logdet: torch.Tensor | None = None) -> tuple[torch.Tensor, torch.Tensor, dict[str, list[torch.Tensor]]]:
             """前向传播
 
             Args:
@@ -76,11 +76,11 @@ class MetaBlock(torch.nn.Module):
         self._config = config
         super().__init__()
         self.proj_in = torch.nn.Linear(self._config.channels_in, self._config.channels_hidden)
-        self.pos_embed = torch.nn.Parameter(torch.randn(self._config.num_patches, self._config.channels_hidden) * 1e-2)
+        self.pos_embed_matrix = torch.nn.Parameter(torch.randn(self._config.num_patches, self._config.channels_hidden) * 1e-2)
         """位置嵌入编码使用的矩阵(可学习参数).
 
         `shape: (L, C_hidden)` """
-        self.class_embed = torch.nn.Parameter(
+        self.class_embed_matrix = torch.nn.Parameter(
             torch.randn(
                 self._config.num_classes,
                 1,
@@ -105,8 +105,30 @@ class MetaBlock(torch.nn.Module):
                 torch.ones(
                     self._config.num_patches,
                     self._config.num_patches)))  # 注意力 mask, 下三角全为1的矩阵, 用于屏蔽未来的信息
+        # properties
+        self._pos_embed: torch.Tensor = None  # type: ignore
 
-    def forward(self, x: torch.Tensor, y: torch.Tensor | None = None) -> tuple[torch.Tensor, torch.Tensor]:
+    # region properties
+    @property
+    def pos_embed(self) -> torch.Tensor:
+        """shape: (L, C_hidden)
+
+        Returns:
+            permutatedpos_embed_matrix (torch.Tensor): 置换后的 pos_embed_matrix
+        """
+        if not self._pos_embed:
+            self._pos_embed = self.permutation(self.pos_embed_matrix, dim=0)
+        return self._pos_embed
+
+    @pos_embed.setter
+    def pos_embed(self, value: torch.Tensor):
+        if value:
+            self._pos_embed = value
+        else:
+            self._pos_embed = None  # type: ignore
+    # endregion
+
+    def forward(self, x: torch.Tensor, y: torch.Tensor | None = None) -> tuple[torch.Tensor, torch.Tensor, dict[str, list[torch.Tensor]]]:
         """前向传播
 
         Args:
@@ -122,52 +144,16 @@ class MetaBlock(torch.nn.Module):
         # 缓存x备用
         x_hat = x  # shape: (B, L, C)
 
-        # 位置嵌入编码
-        pos_embed = self.permutation(self.pos_embed, dim=0)  # shape: (L, C_hidden)
-        x = self.proj_in(x) + pos_embed  # shape: (B, L, C_hidden)
+        # 位置嵌入编码 + 投影 in
+        x = self.proj_in(x) + self.pos_embed  # shape: (B, L, C_hidden)
 
-        # classifier guidance 和 classifier free guidance
-        if self.class_embed is not None:  # 有分类引导
-
-            if y is not None:  # 有分类标签
-
-                if (y < 0).any():  # 存在负标签
-                    m = (y < 0).float().view(-1, 1, 1)  # 遮罩, 标签 <0 为1, 否则为0. shape: (B, 1, 1)
-                    class_embed = (1 - m) * self.class_embed[y] + m * self.class_embed.mean(dim=0)
-                    # (1-m) :shape (B, 1, 1)
-                    #
-                else:
-                    class_embed = self.class_embed[y]  # shape: (B, 1, C_hidden)
-                x = x + class_embed
-
-            else:  # 没有分类引导
-
-                x = x + self.class_embed.mean(dim=0)
-        else:
-            pass  # 没有分类引导, 不做任何操作
+        # 分类引导处理
+        x = self._classifier_guidance(x, y)
 
         # 计算注意力
-        for block in self.attn_blocks:
-            x = block(x, self.attn_mask)  # shape: (B, L, C_hidden)
-            # region NOTE ⚠ 结合 attn_mask, attention 的作用 ⚠
-            # 实现仿射耦合层的多块划分, 下式为原论文的公式(3):( $$\pi(z)$$ 是上面的 permutation() )
-            r"""
-            $$
-            \begin{eqnarray}
-            \hspace{10em}z_0 &=& x_0\\
-            \hspace{10em}z_1 &=& \big(x_1 - \mu_1(x_{<1})\big) \otimes \exp\big(-\alpha_1(x_{<1})\big)\\
-            \hspace{10em}z_2 &=& \big(x_2 - \mu_2(x_{<2})\big) \otimes \exp\big(-\alpha_2(x_{<2})\big)\\
-            \hspace{10em} &\cdots& \\
-            \hspace{10em}z_{L-1} &=& \big(x_{L-1} - \mu_{L-1}(x_{<L-1})\big) \otimes \exp\big(-\alpha_{L-1}(x_{<L-1})\big)
-            \end{eqnarray}
-            $$
-            """
-            # 其中 $$ x_{<k} = [x_1,x_2,...,x_{k-1}] $$
-            # 考虑到 attn_mask 是值全为1的下三角矩阵, transformer 第 k 个元素仅由 第0~第k-1 个元素决定
-            # 因此, 可以认为 Attention 的每一行在做如下操作:
-            # $$line_k = f_k(x_{<k})$$
-            # 对应上式公式(3), 可以把 Attention 的操作 $$f_k(x_{<k})$$ 以某种形式拆分成两部分, 一部分当作 $$\mu_k(x_{<k}) $$, 一部分当作 $$ \alpha_k(x_{<k}) $$
-            # endregion
+        x = self._attention(x)
+
+        # 投影 out
         x = self.proj_out(x)  # shape: (B, L, C * (1+nvp) )
 
         # 梯度断裂
@@ -184,22 +170,23 @@ class MetaBlock(torch.nn.Module):
         # endregion
 
         # 把输出 $$f_i(x_{<i})$$ 拆分成两个部分: $$\alpha_i(x_{<i})$$ 和 $$\mu_i(x_{<i})$$
-        if self.nvp:
-            x_alpha, x_mu = x.chunk(2, dim=-1)  # shape: (B, L, C)
-        else:
-            x_mu = x
-            x_alpha = torch.zeros_like(x)  # shape: (B, L, C)
-        # region NOTE NVP和非NVP
-        # 在不启用NVP时, logdet 显然应该为 0, logdet 又和 $$\alpha_i(\cdot)$$ 有关.
-        # 一个简单实现的方式是令 $$ \alpha_i(\cdot) =0 $$
-        # 即上面 else 块的做法: 令 $$f_i(\cdot) = \mu_i(\cdot)$$, $$ \alpha_i(\cdot)$$
-        # endregion
+        x_alpha, x_mu = self._split_to_alpha_and_mu(x)
 
         scale = (-x_alpha.float()).exp().type(x_alpha.dtype)
         # region NOTE 计算缩放因子
         # 原论文公式(3) $$ \odot $$ 后的部分:
         # $$ \exp(-\alpha_i(x_{<i})) $$
         # endregion
+
+        z = (x_hat - x_mu) * scale  # shape: (B, L, C)
+
+        # add in GSJ paper
+        d = {}
+        if self._config.detect_mode:
+            ign = self._calculateIGN(x_hat, z)
+            crn = self._calculateCRN(x_alpha, x_hat)
+            d["IGN"] = ign
+            d["CRN"] = crn
 
         logdet = -x_alpha.mean(dim=[1, 2])  # shape: (B)
         # region NOTE 求雅可比行列式的值
@@ -209,7 +196,9 @@ class MetaBlock(torch.nn.Module):
         #
         # endregion
 
-        return self.permutation((x_hat - x_mu) * scale, inverse=True), logdet
+        self.pos_embed = None  # type: ignore
+
+        return self.permutation(z, inverse=True), logdet, d
 
     def reverse(
         self,
@@ -236,7 +225,7 @@ class MetaBlock(torch.nn.Module):
 
         # 置换操作, 在原论文内由 $$ \pi^{-1}(z) $$ 表示
         x = self.permutation(x)  # shape: (B, L, C)
-        pos_embed = self.permutation(self.pos_embed, dim=0)  # shape: (L, C_hidden)
+        pos_embed = self.permutation(self.pos_embed_matrix, dim=0)  # shape: (L, C_hidden)
         self._set_sample_mode(True)
         L = x.size(1)
         for i in range(L - 1):  # x按行计算,每行为 (B,1,C_hidden). 注意 共有L-1个元素, 这是由于 x_l-1 不需要变更
@@ -320,11 +309,11 @@ class MetaBlock(torch.nn.Module):
         x_i = self.proj_in(x_i) + pos_embed[i: i + 1]  # shape: (B, 1, C_hidden)
 
         # 类型引导
-        if self.class_embed is not None:  # 有分类引导
+        if self.class_embed_matrix is not None:  # 有分类引导
             if y is not None:  # x_i 有标签
-                x_i = x_i + self.class_embed[y]  # shape: (B, 1, C_hidden)
+                x_i = x_i + self.class_embed_matrix[y]  # shape: (B, 1, C_hidden)
             else:  # x_i 没有标签
-                x_i = x_i + self.class_embed.mean(dim=0)
+                x_i = x_i + self.class_embed_matrix.mean(dim=0)
         else:  # 没有分类引导, 不做任何操作
             pass
 
@@ -360,3 +349,113 @@ class MetaBlock(torch.nn.Module):
         for m in self.modules():
             if isinstance(m, Attention):
                 m.sample = flag
+
+    def _calculateIGN(self, x_star: torch.Tensor, Z: torch.Tensor) -> list[torch.Tensor]:
+        """计算 IGN 指数
+
+        Args:
+            x_star (torch.Tensor): X*
+            Z (torch.Tensor): X* `forward` 计算得到的 Z
+
+
+        Returns:
+            IGN指数 (list[torch.Tensor]): Z 和 Z0的 IGN指数
+        """
+        z0 = torch.cat([x_star[:, :1, :], torch.zeros_like(x_star[:, 1:, :])], dim=1)
+        IGN = []
+        for z_ in [Z, z0]:
+
+            # region 把 $$Z$$ 和 $$Z_0$$ 分别作为 $$ X^{(0)}$$, 代入 $$\sum(X^{(0)})Z + \mu(X^{(0)}) - X^*$$
+            z_ = self.proj_in(z_) + self.pos_embed
+            if self.class_embed_matrix is not None:
+                z_ = z_ + self.class_embed_matrix.mean(dim=0)
+            for block in self.attn_blocks:
+                z_ = block(z_, self.attn_mask)
+            z_ = self.proj_out(z_)
+
+            z_ = torch.cat([torch.zeros_like(z_[:, :1, :]), z_[:, :-1, :]], dim=1)
+
+            z_alpha, z_mu = z_.chunk(2, dim=-1)
+
+            scale = (z_alpha.float()).exp().type(z_alpha.dtype)
+            res = (scale * Z + z_mu) - x_star
+            # endregion
+
+            # 在 Batch 上求平均得到平均 (L,C), 再求矩阵 (L,C) 的 norm
+            singular_value: torch.Tensor = torch.linalg.norm(res.mean(dim=0), ord=self._config.norm)
+            IGN.append(singular_value.item())
+        return IGN
+
+    def _calculateCRN(self, alpha: torch.Tensor, x_star: torch.Tensor) -> list[torch.Tensor]:
+        CRN = []
+
+        # 计算 $$||{\sum}^{-1}(X)X||_2$$
+        CRN.append(torch.linalg.norm((alpha * x_star).sum(dim=0), ord=self._config.norm).item())
+
+        # 计算 $$||W_s||_2$$ 和 $$||W_u||_2$$
+        W: torch.Tensor = self.proj_out.weight
+        W_s, W_u = W.chunk(2, dim=0)
+        CRN.append(torch.linalg.norm(W_s, ord=self._config.norm).item())
+        CRN.append(torch.linalg.norm(W_u, ord=self._config.norm).item())
+
+        # 计算最终的CRM $$||{\sum}^{-1}(X)X||_2 * ||W_s||_2 + ||W_u||_2$$
+        CRN.append(CRN[0] * CRN[1] + CRN[2])
+        return CRN
+
+    def _classifier_guidance(self, x: torch.Tensor, y: torch.Tensor | None):
+        if self.class_embed_matrix is not None:  # 有分类引导
+
+            if y is not None:  # 有分类标签
+
+                if (y < 0).any():  # 存在负标签
+                    m = (y < 0).float().view(-1, 1, 1)  # 遮罩, 标签 <0 为1, 否则为0. shape: (B, 1, 1)
+                    class_embed = (1 - m) * self.class_embed_matrix[y] + m * self.class_embed_matrix.mean(dim=0)
+                    # (1-m) :shape (B, 1, 1)
+                    #
+                else:
+                    class_embed = self.class_embed_matrix[y]  # shape: (B, 1, C_hidden)
+                x = x + class_embed
+
+            else:  # 没有分类引导
+
+                x = x + self.class_embed_matrix.mean(dim=0)
+        else:
+            pass  # 没有分类引导, 不做任何操作
+        return x
+
+    def _attention(self, x: torch.Tensor) -> torch.Tensor:
+        for block in self.attn_blocks:
+            x = block(x, self.attn_mask)  # shape: (B, L, C_hidden)
+            # region NOTE ⚠ 结合 attn_mask, attention 的作用 ⚠
+            # 实现仿射耦合层的多块划分, 下式为原论文的公式(3):( $$\pi(z)$$ 是上面的 permutation() )
+            r"""
+            $$
+            \begin{eqnarray}
+            \hspace{10em}z_0 &=& x_0\\
+            \hspace{10em}z_1 &=& \big(x_1 - \mu_1(x_{<1})\big) \otimes \exp\big(-\alpha_1(x_{<1})\big)\\
+            \hspace{10em}z_2 &=& \big(x_2 - \mu_2(x_{<2})\big) \otimes \exp\big(-\alpha_2(x_{<2})\big)\\
+            \hspace{10em} &\cdots& \\
+            \hspace{10em}z_{L-1} &=& \big(x_{L-1} - \mu_{L-1}(x_{<L-1})\big) \otimes \exp\big(-\alpha_{L-1}(x_{<L-1})\big)
+            \end{eqnarray}
+            $$
+            """
+            # 其中 $$ x_{<k} = [x_1,x_2,...,x_{k-1}] $$
+            # 考虑到 attn_mask 是值全为1的下三角矩阵, transformer 第 k 个元素仅由 第0~第k-1 个元素决定
+            # 因此, 可以认为 Attention 的每一行在做如下操作:
+            # $$line_k = f_k(x_{<k})$$
+            # 对应上式公式(3), 可以把 Attention 的操作 $$f_k(x_{<k})$$ 以某种形式拆分成两部分, 一部分当作 $$\mu_k(x_{<k}) $$, 一部分当作 $$ \alpha_k(x_{<k}) $$
+            # endregion
+        return x
+
+    def _split_to_alpha_and_mu(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        if self._config.nvp:
+            x_alpha, x_mu = x.chunk(2, dim=-1)  # shape: (B, L, C)
+        else:
+            x_mu = x
+            x_alpha = torch.zeros_like(x)  # shape: (B, L, C)
+        # region NOTE NVP和非NVP
+        # 在不启用NVP时, logdet 显然应该为 0, logdet 又和 $$\alpha_i(\cdot)$$ 有关.
+        # 一个简单实现的方式是令 $$ \alpha_i(\cdot) =0 $$
+        # 即上面 else 块的做法: 令 $$f_i(\cdot) = \mu_i(\cdot)$$, $$ \alpha_i(\cdot)$$
+        # endregion
+        return x_alpha, x_mu

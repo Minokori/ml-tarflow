@@ -60,7 +60,6 @@ class Model(torch.nn.Module):
     def __init__(self, config: TarflowConfig):
         super().__init__()
         self._config = config
-
         self.permutations: list[Permutation] = [PermutationIdentity(config.num_patches), PermutationFlip(config.num_patches)]
         blocks = []
         for i in range(config.blocks_num):
@@ -127,7 +126,7 @@ class Model(torch.nn.Module):
 
         # 计算并保留每层的输出
         for block in self.blocks:
-            x, logdet = block(x, y)  # shape: (B, L, C), (B)
+            x, logdet,d = block(x, y)  # shape: (B, L, C), (B)
             logdets = logdets + logdet
             outputs.append(x)
         return x, outputs, logdets
@@ -153,7 +152,6 @@ class Model(torch.nn.Module):
         Returns:
             torch.Tensor: 训练损失
         """
-        return 0.5 * z.pow(2).mean() - logdets.mean()
         # region NOTE 损失函数
         # 原论文公式(6):
         #
@@ -177,6 +175,7 @@ class Model(torch.nn.Module):
         # sum() 运算在这里显然可以省略, 即为 return 语句的表达式:
         # 0.5 * z.pow(2).mean() - logdets.mean()
         # endregion
+        return 0.5 * z.pow(2).mean() - logdets.mean()
 
     def reverse(
         self,
