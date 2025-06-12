@@ -2,8 +2,10 @@
 from functools import cached_property
 from typing import TYPE_CHECKING, Literal
 
-from config import AttentionConfig
 import torch
+from torch.linalg import vector_norm
+
+from config import AttentionConfig
 
 
 # 符号说明:
@@ -13,7 +15,7 @@ import torch
 # H: 注意力头数 (number of attention heads)
 # D: 每个注意力头的维度 (dimension of each attention head)
 # H * D =C
-
+# [TODO] sample 删掉, 换成GSJmode, J是正向, GS/GSJ 是逆向
 class Attention(torch.nn.Module):
     """注意力模块"""
     USE_SDPA: bool = True
@@ -88,26 +90,32 @@ class Attention(torch.nn.Module):
         self.proj = torch.nn.Linear(self._config.channels_in, self._config.channels_in)
         """投影"""
 
-        self._sample = False
-        """是否为采样(逆运算)模式"""
-        self._k_cache: dict[str, list[torch.Tensor]] = {'cond': [], 'uncond': []}
+        self._k_cache: dict[str, list[torch.Tensor]] = {'cond': [], 'uncond': [],
+                                                        'cond_temp': torch.tensor([]), 'uncond_temp': torch.tensor([])}  # type: ignore
         """K矩阵的缓存. 仅在逆运算时使用"""
-        self._v_cache: dict[str, list[torch.Tensor]] = {'cond': [], 'uncond': []}
+        self._v_cache: dict[str, list[torch.Tensor]] = {'cond': [],  # type: ignore
+                                                        'uncond': [], 'cond_temp': torch.tensor([]), 'uncond_temp': torch.tensor([])}
         """V矩阵的缓存, 仅在逆运算时使用"""
 
+        self._GSJmode: Literal["GS", "J", "GSJ"] = "J"
+
+
     @property
-    def sample(self) -> bool:
-        """是否为采样(逆运算)模式
+    def GSJmode(self) -> Literal["GS", "J", "GSJ"]:
+        """GSJ 模式
 
-        改变该属性会清空 K 和 V 的缓存
+        + `"J"` : 正向运算
+        + `"GSJ"` :
         """
-        return self._sample
+        return self._GSJmode
 
-    @sample.setter
-    def sample(self, value: bool):
-        self._sample = value
-        self._k_cache = {'cond': [], 'uncond': []}
-        self._v_cache = {'cond': [], 'uncond': []}
+    @GSJmode.setter
+    def GSJmode(self, value: Literal["GS", "J", "GSJ"]):
+        """设置 GSJ 模式"""
+        if value not in ["GS", "J", "GSJ"]:
+            raise ValueError("GSJmode must be one of 'GS', 'J', or 'GSJ'")
+        self._GSJmode = value
+        self.sample = self.sample
 
     @cached_property
     def _sqrt_scale(self) -> float:
@@ -136,11 +144,12 @@ class Attention(torch.nn.Module):
         x = self.norm(x.float()).type(x.dtype)
 
         # 计算 Q, K, V 矩阵
-        q, k, v = self.qkv(x).reshape(B, L, 3 * self._config.num_heads, -1).transpose(1, 2).chunk(3, dim=1)  # (b, h, l, d)
         # x -> qkv       shape: (b, l, 3 * c)
         #   -> reshape   shape: (b, l, 3 * h, d), h = num_heads, d = head_dim, h * d = c
         #   -> transpose shape: (b, 3 * h, l, d)
         #   -> chunk     shape: 3 * (b, h, l, d)
+        q, k, v = self.qkv(x).reshape(B, L, 3 * self._config.num_heads, -1).transpose(1, 2).chunk(3, dim=1)  # (b, h, l, d)
+
 
         # 逆运算时,计算 attention 时的 mask 为空, 使用缓存的kv矩阵计算
         if self.sample:
@@ -158,11 +167,33 @@ class Attention(torch.nn.Module):
             # 最后一次逆计算时, i= L-1, torch.cat() 后 shape: (B,h,L,d)
             # endregion
 
+        match self.GSJmode:
+            case "GSJ":  # 逆运算, 每次 forward 传入的
+                self._k_cache[which_cache + "_temp"] = k  # type: ignore
+                self._v_cache[which_cache + "_temp"] = v  # type: ignore
+
+                if (len(self._k_cache[which_cache]) == 0):
+                    k = self._k_cache[which_cache + '_temp']
+                    v = self._v_cache[which_cache + '_temp']
+                else:
+                    k = torch.cat([torch.cat(self._k_cache[which_cache], dim=2), self._k_cache[which_cache + '_temp']], dim=2)  # type: ignore
+                    v = torch.cat([torch.cat(self._v_cache[which_cache], dim=2), self._v_cache[which_cache + '_temp']], dim=2)  # type: ignore
+
+            case "GS":
+                self._k_cache[which_cache].append(k)
+                self._v_cache[which_cache].append(v)
+                k = torch.cat(self._k_cache[which_cache], dim=2)
+                v = torch.cat(self._v_cache[which_cache], dim=2)
+            case _:
+                pass
+
+
         # 计算缩放因子 $$ d_k $$
-        scale = self._sqrt_scale**2 / tau
         # region NOTE
         # 该操作在原论文(11)式前描述, 将 attention 的 log 除以 tau
         # endregion
+        scale = self._sqrt_scale**2 / tau
+
 
         # 正向计算时, mask为下三角矩阵, 逆运算时, mask 为 None
         if mask is not None:
