@@ -19,6 +19,10 @@ from nn.blockmodule import *
 # C_hidden: 隐藏层通道数
 
 class MetaBlock(torch.nn.Module):
+    """
+
+    + 相较于 TarFlow 删除 NVP 相关设置, 默认启用 NVP
+    """
     # attn_mask
     # region TYPR_CHECKING
     if TYPE_CHECKING:
@@ -135,7 +139,9 @@ class MetaBlock(torch.nn.Module):
 
     @GSJmode.setter
     def GSJmode(self, value: Literal["GS", "J", "GSJ"]):
-        """设置 GSJ 模式
+        """设置 GSJ 模式.
+
+        在设置时, 会改变内部所有 Attention 模块的 GSJmode 属性.
 
         Args:
             value (Literal["GS", "J", "GSJ"]): GSJ 模式
@@ -222,13 +228,8 @@ class MetaBlock(torch.nn.Module):
         return self.permutation(z, inverse=True), logdet, d
 
     def reverse(
-        self,
-        x: torch.Tensor,
-        y: torch.Tensor | None = None,
-        hyper_parameters: ReverseHyperParameters = ReverseHyperParameters(),
-        show_trace: bool = False,
-        X_target: torch.Tensor | None = None,
-    ) -> torch.Tensor:
+        self,x: torch.Tensor,y: torch.Tensor | None = None,
+        hyper_parameters: ReverseHyperParameters = ReverseHyperParameters(),) -> torch.Tensor:
         """_summary_
 
         Args:
@@ -242,142 +243,36 @@ class MetaBlock(torch.nn.Module):
         Returns:
             torch.Tensor: 输出张量(序列), shape: (B,L,C)
         """
+        B, L, C = x.size()  # shape: (B, L, C)
 
         # 置换操作, 在原论文内由 $$ \pi^{-1}(z) $$ 表示
-        B, L, C = x.size()  # shape: (B, L, C)
         x = self.permutation(x)  # shape: (B, L, C)
 
-        hyper_parameters, jacobi_size = self._set_GSJmode(hyper_parameters, L)
+        hyper_parameters = self._set_GSJmode(hyper_parameters, L)
 
+        # 根据zeroguess(IGM)决定采用何种方式输入 x
         if hyper_parameters.zero_guess == 0:
-            x_next = x.clone()  # shape: (B, L, C)
+            x_to_input = x.clone()  # shape: (B, L, C)
         else:
-            x_next = torch.cat([x[:, :1, :], torch.zeros_like(x[:, 1:, :])], dim=1)
+            x_to_input = torch.cat([x[:, :1, :], torch.zeros_like(x[:, 1:, :])], dim=1)
 
         match self.GSJmode:
             case "GS":  # TarFlow 的原始逆运算方式
-                z = self._GS_reverse(x_next, y, hyper_parameters)
+                z = self._GS_reverse(x_to_input, y, hyper_parameters)
                 z = self.permutation(z, inverse=True)  # shape: (B, L, C)
                 pass
             case "J":  # GSJ 论文的 **纯并行** 逆运算方式
-                z = self._J_reverse(x_next, y, x, hyper_parameters)
+                z = self._J_reverse(x_to_input, y, x, hyper_parameters)
                 z = self.permutation(z, inverse=True)  # shape: (B, L, C)
             case "GSJ":  # GSJ 论文的 **混合** 逆运算方式
-                pass
+                z = self._GSJ_reverse(x_to_input, y,x, hyper_paras=hyper_parameters)
+                z = self.permutation(z, inverse=True)  # shape: (B, L, C)
 
-
-
-        for i in range(L - 1):  # x按行计算,每行为 (B,1,C_hidden). 注意 共有L-1个元素, 这是由于 x_l-1 不需要变更
-
-            # 计算条件引导下的逆运算
-            z_alpha_cond, z_mu_cond = self._reverse_step(x, self.pos_embed, i, y, which_cache='cond')  # shape: (B,1,C_hidden)
-
-            z_alpha = z_alpha_cond
-            z_mu = z_mu_cond
-
-            # 计算非条件引导下的逆运算
-            if guidance > 0 and guide_what:
-                z_alpha_uncond, z_mu_uncond = self._reverse_step(x, self.pos_embed, i, None, tau=tau, which_cache='uncond')
-
-                # 确定引导权重 w_i
-                if annealed_guidance:
-                    w_i = (i + 1) / (L - 1) * guidance
-                    # region NOTE
-                    # 在原论文公式(11)后, 为:
-                    #
-                    # $$ w_i = \frac{i+1}{L-1}w $$
-                    #
-                    # endregion
-                else:
-                    w_i = guidance
-
-                # 非条件引导
-                if 'a' in guide_what:
-                    z_alpha = z_alpha_cond + w_i * (z_alpha_cond - z_alpha_uncond)
-                if 'b' in guide_what:
-                    z_mu = z_mu_cond + w_i * (z_mu_cond - z_mu_uncond)
-                # shape: (B,1,C_hidden)
-                # region NOTE
-                # 对应原论文公式(11):
-                r"""
-                $$
-                \begin{eqnarray}
-                \hspace{8em}\alpha_i(z_{<i};\tau,w) &=& (1+w) \alpha_i(z_{<i};1) - w\alpha_i(z_{<i},\tau)\\
-                \hspace{8em}\mu_i(z_{<i};\tau,w) &=& (1+w) \mu_i(z_{<i};1) - w\mu_i(z_{<i},\tau)
-                \end{eqnarray}
-                $$
-                """
-                # endregion
-
-            # BUG exp 后可能会导致溢出, 使计算变为 NaN
-            scale = z_alpha[:, 0].float().exp().type(z_alpha.dtype)  # shape: (B,C_hidden)
-
-            # 上面计算的是第 i 行的逆运算, 替换原来的第 i 行
-            x[:, i + 1] = x[:, i + 1] * scale + z_mu[:, 0]
         self.pos_embed = None  # type: ignore
+        self.GSJmode = "J"
         return self.permutation(x, inverse=True)
 
-    def _reverse_step(
-        self,
-        x: torch.Tensor,
-        pos_embed: torch.Tensor,
-        i: int,
-        y: torch.Tensor | None = None,
-        tau: float = 1.0,
-        which_cache: Literal["cond", "uncond"] = 'cond',
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        """单行 X 的反向传播
-
-        Args:
-            x (torch.Tensor): 输入张量(序列), shape: (B, L, C)
-            pos_embed (torch.Tensor): 位置编码矩阵, shape: (L, C_hidden)
-            i (int): 当前的行数 (第i行只能看到第i行之前的信息)
-            y (torch.Tensor | None, optional): 输入张量对应的标签, shape: (B). Defaults to None.
-            tau (float, optional): 手动注入温度项. Defaults to 1.0.
-            which_cache (str, optional): 使用的缓存. Defaults to 'cond'.
-
-        Returns:
-            tuple[torch.Tensor, torch.Tensor]: x_alpha, x_mu
-        """
-
-        # 获得序列的第 i 个元素, i<=0<L
-        # 注意, 使用 x_i[:,i]会使形状变为 (B,C), 这里需要保留维度
-        x_i = x[:, i: i + 1]  # shape: (B,1,C).
-
-        # 位置投影
-        x_i = self.proj_in(x_i) + pos_embed[i: i + 1]  # shape: (B, 1, C_hidden)
-
-        # 类型引导
-        if self.class_embed_matrix is not None:  # 有分类引导
-            if y is not None:  # x_i 有标签
-                x_i = x_i + self.class_embed_matrix[y]  # shape: (B, 1, C_hidden)
-            else:  # x_i 没有标签
-                x_i = x_i + self.class_embed_matrix.mean(dim=0)
-        else:  # 没有分类引导, 不做任何操作
-            pass
-
-        # 计算注意力, 相当于得到 $$ f(x) $$
-        for block in self.attn_blocks:
-            x_i = block(x_i, tau=tau, which_cache=which_cache)  # here we use kv caching, so no attn_mask
-            # region NOTE key, value 缓存的作用
-            # 由于每次只计算一行 x_i, k,v中保存了前i行的 k,v,和 mask效果相同
-            # endregion
-        x_i = self.proj_out(x_i)  # shape: (B, 1, C * (1+nvp) )
-
-        # 将输出 $$ f(x_{<i}) $$ 拆成两部分: $$\alpha_i(x_{<i})$$ 和 $$\mu_i(x_{<i})$$
-        if self.nvp:
-            x_alpha, x_mu = x_i.chunk(2, dim=-1)  # shape: (B, 1, C)
-        else:
-            x_mu = x_i
-            x_alpha = torch.zeros_like(x_i)  # shape: (B, 1, C)
-        # region NOTE NVP和非NVP
-        # 在不启用NVP时, logdet 显然应该为 0, logdet 又和 $$\alpha_i(\cdot)$$ 有关.
-        # 一个简单实现的方式是令 $$ \alpha_i(\cdot) =0 $$
-        # 即上面 else 块的做法: 令 $$f_i(\cdot) = \mu_i(\cdot)$$, $$ \alpha_i(\cdot) $$
-        # endregion
-        return x_alpha, x_mu
-
-
+    # region forward 的子步骤
     def _calculateIGN(self, x_star: torch.Tensor, Z: torch.Tensor) -> list[torch.Tensor]:
         """计算 IGN 指数
 
@@ -476,17 +371,17 @@ class MetaBlock(torch.nn.Module):
         return x
 
     def _split_to_alpha_and_mu(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-        if self._config.nvp:
-            x_alpha, x_mu = x.chunk(2, dim=-1)  # shape: (B, L, C)
-        else:
-            x_mu = x
-            x_alpha = torch.zeros_like(x)  # shape: (B, L, C)
+
+        x_alpha, x_mu = x.chunk(2, dim=-1)  # shape: (B, L, C)
+
         # region NOTE NVP和非NVP
         # 在不启用NVP时, logdet 显然应该为 0, logdet 又和 $$\alpha_i(\cdot)$$ 有关.
         # 一个简单实现的方式是令 $$ \alpha_i(\cdot) =0 $$
         # 即上面 else 块的做法: 令 $$f_i(\cdot) = \mu_i(\cdot)$$, $$ \alpha_i(\cdot)$$
         # endregion
         return x_alpha, x_mu
+
+    # endregion
 
     def _reverse_substep(self,
                          x: torch.Tensor,
@@ -522,28 +417,39 @@ class MetaBlock(torch.nn.Module):
         x = self.proj_out(x)
         x_alpha, x_mu = x.chunk(2, dim=-1)
         return x_alpha, x_mu
-        pass
 
     def _GS_reverse(self, x: torch.Tensor,
                     y: torch.Tensor | None = None,
                     hyper_paras: ReverseHyperParameters = ReverseHyperParameters()) -> torch.Tensor:
+        """GS 逆运算
+        逆运算的核心步骤, 逐行计算逆运算, 每行的逆运算依赖于前一行的结果.
+
+        Args:
+            x (torch.Tensor): 输入张量(序列), shape: (B, L, C)
+            y (torch.Tensor | None, optional): 输入对应的标签, shape: (B,). Defaults to None.
+            hyper_paras (ReverseHyperParameters, optional): 超参数. Defaults to ReverseHyperParameters().
+
+        Returns:
+            x (torch.Tensor): 逆运算后的张量(序列), shape: (B, L, C)
+        """
+
         L = x.size(1)  # shape: (B, L, C), L为序列长度
         for i in range(L - 1):  # x 按行计算,每行 shape = (B, 1, C). 注意 共有 L-1 个元素, 这是由于 x[l-1] 不需要变更
 
-            x_in = x[:, i:i + 1, :]  # 取出索引为 i 的行, shape: (B, 1, C)
+            x_single_line = x[:, i:i + 1, :]  # 取出索引为 i 的行, shape: (B, 1, C)
 
             # 位置投影
-            x = self.proj_in(x_in) + self.pos_embed[i:i + 1, :]  # shape: (B,1,C_hidden)
+            x_temp = self.proj_in(x_single_line) + self.pos_embed[i:i + 1, :]  # shape: (B,1,C_hidden)
 
             # 计算条件引导下的逆运算
-            x_alpha_cond, x_mu_cond = self._reverse_substep(x, y, jacobi_attn_mask=None, tau=1.0, which_cache='cond')
+            x_alpha_cond, x_mu_cond = self._reverse_substep(x_temp, y, jacobi_attn_mask=None, tau=hyper_paras.tau, which_cache='cond')
 
             x_alpha = x_alpha_cond
             x_mu = x_mu_cond
 
             # 计算非条件引导下的逆运算 , ab 指示引导 $$\alpha(x)$$ 和 $$\mu(x)$$ 的哪部分
             if hyper_paras.no_classification_guide:
-                x_alpha_uncond, x_mu_uncond = self._reverse_substep(x, None, jacobi_attn_mask=None, tau=hyper_paras.tau, which_cache='uncond')
+                x_alpha_uncond, x_mu_uncond = self._reverse_substep(x_temp, None, jacobi_attn_mask=None, tau=hyper_paras.tau, which_cache='uncond')
 
                 # 确定引导权重 w_i
                 if hyper_paras.annealed_guidance:
@@ -578,24 +484,37 @@ class MetaBlock(torch.nn.Module):
             scale = x_alpha[:, 0].float().exp().type(x_alpha.dtype)  # shape: (B, C_hidden)
 
             # 上面计算的是第 i 行的逆运算, 替换原来的第 i 行
-            x[:, i + 1] = x[:, i + 1] * scale + x_mu[:, 0]
+            x[:, i + 1] = x[:, i + 1]* scale  + x_mu[:, 0]
         return x  # shape: (B, L, C)  # 返回逆运算后的结果
 
     def _J_reverse(
             self,
             x: torch.Tensor,
             y: torch.Tensor | None,
-            x_origin: torch.Tensor,
+            z: torch.Tensor,
             hyper_paras: ReverseHyperParameters = ReverseHyperParameters()) -> torch.Tensor:
+        """Jacobi 逆运算
+
+        Args:
+            x (torch.Tensor): 输入张量(序列) 的 Jacobi chunk, shape: (B, J, C)
+            y (torch.Tensor | None): 输入张量对应的标签, shape: (B,). Defaults to None.
+            z (torch.Tensor): 本块原始输入张量(序列) 的 Jacobi chunk, shape: (B, J, C)
+            hyper_paras (ReverseHyperParameters, optional): 超参数. Defaults to ReverseHyperParameters().
+
+        Returns:
+            x (torch.Tensor): shape: (B, J, C)
+        """
         # 初始化
-        B, L, C = x.shape
-        x_current = x_next = x
+        B, J, C = x.shape
+        x_current = x  # X迭代之前的初始值
         iter_count = 0  # 迭代次数
         diff = 1e6  # 差值, 用于判断迭代是否收敛
-        iter_trace = []  # 迭代轨迹, 用于调试
 
-        while iter_count < hyper_paras.max_jacobi and diff > hyper_paras.ebound:  # 当未满足迭代停止条件和收敛条件时, 使用x_current反复更新 x_next
-            x_next = self.proj_in(x_current) + self.pos_embed  # shape: (B, L, C_hidden)
+        # 当未满足迭代停止条件和收敛条件时, 使用 x_current 反复更新 x_next
+        while iter_count < hyper_paras.max_jacobi and diff > hyper_paras.ebound:
+
+            # region 用 x_current 计算 x_next, 等效于 x_next = func(x_current)
+            x_next = self.proj_in(x_current) + self.pos_embed  # shape: (B, J, C_hidden)
 
             # 分类引导
             x_alpha_cond, x_mu_cond = self._reverse_substep(x_next, y, jacobi_attn_mask=self.attn_mask, tau=hyper_paras.tau, which_cache='cond')
@@ -604,16 +523,15 @@ class MetaBlock(torch.nn.Module):
             x_mu = x_mu_cond
 
             if hyper_paras.guidance > 0 and hyper_paras.guide_what:
-                # [TODO] 检查是否用 "cond"
                 x_alpha_uncond, x_mu_uncond = self._reverse_substep(
                     x_next, None, jacobi_attn_mask=self.attn_mask, tau=hyper_paras.tau, which_cache='cond')
 
                 # 确定引导权重 w_i
                 if hyper_paras.annealed_guidance:
-                    w_i: torch.Tensor = torch.arange(1, L + 1, device=x_origin.device) / (L - 1) * hyper_paras.guidance
+                    w_i: torch.Tensor = torch.arange(1, J + 1, device=z.device) / (J - 1) * hyper_paras.guidance
                     w_i = w_i.view(1, -1, 1)
                 else:
-                    w_i = hyper_paras.guidance
+                    w_i = hyper_paras.guidance  # type: ignore
 
                 # 非条件引导
                 if 'a' in hyper_paras.guide_what:
@@ -621,11 +539,12 @@ class MetaBlock(torch.nn.Module):
                 if 'b' in hyper_paras.guide_what:
                     x_mu = x_mu_cond + w_i * (x_mu_cond - x_mu_uncond)
 
-            # 把除第1行外的结果设置为 0
+            # 把第 1 行设置为 0 (梯度截断)
             x_alpha = torch.cat([torch.zeros_like(x_alpha[:, :1, :]), x_alpha[:, :-1, :]], dim=1)
             x_mu = torch.cat([torch.zeros_like(x_mu[:, :1, :]), x_mu[:, :-1, :]], dim=1)
 
-            x_next = ((x_alpha.float().exp().type(x_alpha.dtype)) * x_origin + x_mu).clamp(-3, 3)
+            x_next = ((x_alpha.float().exp().type(x_alpha.dtype)) * z + x_mu).clamp(-3, 3)
+            # endregion
 
             # 更新 判断条件
             diff = torch.linalg.norm(x_next - x_current) / (B * C)
@@ -637,130 +556,157 @@ class MetaBlock(torch.nn.Module):
 
     def _GSJ_reverse(
             self,
-            x: torch.Tensor, x_next: torch.Tensor, z: torch.Tensor,
-            y: torch.Tensor | None = None,
-            incre1: bool = False,
-            max_jacobi: int = 100,
-            ebound: float = 1e-8,
-            num_GS: int = 1,
-            guidance: float = 0,
-            jacobi_size: int = 1,
-            guide_what: str = 'ab',
-            attn_temp: float = 1.0,
-            annealed_guidance: bool = False) -> torch.Tensor:
+            x: torch.Tensor,
+            y: torch.Tensor | None,
+            z: torch.Tensor,
+            hyper_paras: ReverseHyperParameters = ReverseHyperParameters(),
+    ) -> torch.Tensor:
         base_attn_mask = torch.tril(
             torch.ones(
-                jacobi_size,
-                jacobi_size, device=z.device))  # 注意力 mask, 下三角全为1的矩阵, 用于屏蔽未来的信息
-        B, L, C = x.size()  # shape: (B, L, C)
-        for i in range(num_GS):
-            jacobi_attn_mask = torch.cat([torch.ones(jacobi_size, jacobi_size, device=z.device)] * i + [base_attn_mask], dim=1)
-            last = (i == num_GS - 1)
-            if last:
-                z_sub = z[:, -(jacobi_size - 1):, :]
-                pos_embed_sub = self.pos_embed[-jacobi_size:-1]
-                x_curr_sub = x_next[:, -(jacobi_size - 1):].clone()
-                jacobi_attn_mask = jacobi_attn_mask[:-1, :-1]
-            else:
-                z_sub = z[:, (i * jacobi_size + 1):((i + 1) * jacobi_size + 1)]
-                pos_embed_sub = self.pos_embed[(i * jacobi_size):((i + 1) * jacobi_size)]
-                x_curr_sub = x_next[:, (i * jacobi_size + 1):((i + 1) * jacobi_size + 1)].clone()
+                hyper_paras.jacobi_size,
+                hyper_paras.jacobi_size,
+                device=z.device))  # 注意力 mask, 下三角全为1的矩阵, 用于屏蔽未来的信息, shape = (J, J)
+        B, L, C = z.size()  # shape: (B, L, C)
 
-            if incre1 and i == 0:
-                for j in range(jacobi_size):
-                    x_in = x_next[:, i: i + 1]
-                    x = self.proj_in(x_in) + self.pos_embed[i: i + 1]
-                    xa, xc = self._reverse_substep(x, y, jacobi_attn_mask=None, which_cache='cond')
-                    if guidance > 0 and guide_what:
-                        xa_u, xc_u = self._reverse_substep(x, None, jacobi_attn_mask=None, tau=attn_temp, which_cache='uncond')
-                        if annealed_guidance:
-                            g = (i + 1) / (L - 1) * guidance
+        for i in range(hyper_paras.num_GS):  # 对于每个 jacobi 块, 对应原论文伪代码中的第 4 行
+
+            # region NOTE
+            # torch.cat 的第一部分: shape = (J, J) * i 个,
+            # torch.cat 的第二部分: 下三角矩阵, shape = (J, J)
+            # jacobi_attn_mask.shape: (J, (i+1)J )
+            # jacobi_attn_mask 的作用:
+            # 保留索引为 i 的 jacobi 块之前的块的所有信息,
+            # 对索引为 i 的 jacobi 块内的按行保留信息
+            # endregion
+            jacobi_attn_mask = torch.cat([torch.ones(hyper_paras.jacobi_size, hyper_paras.jacobi_size, device=z.device)]
+                                         * i + [base_attn_mask], dim=1)
+
+            # 判断该行是不是最后一个 jacobi 块. 最后一个 jacobi 块长度可能不为 J
+            is_last_jacobi_chunk: bool = (i == hyper_paras.num_GS - 1)
+
+            # region 初始化 每个 Jacobi 块 进行 J 运算需要的 x, z, z对应的 pos_embed
+            if is_last_jacobi_chunk:
+                z_sub = z[:, -(hyper_paras.jacobi_size - 1):, :]  # 从原始 Z 中取出 最后一个 jacobi 块, shape: (B, J, C)
+                pos_embed_sub = self.pos_embed[-hyper_paras.jacobi_size:-1]
+                x_curr_sub = x[:, -(hyper_paras.jacobi_size - 1):].clone()
+                jacobi_attn_mask = jacobi_attn_mask[:-1, :-1]  # shape: (J-1, (i+1)J-1 )
+            else:
+                z_sub = z[:, (i * hyper_paras.jacobi_size + 1):((i + 1) * hyper_paras.jacobi_size + 1),:]  # 从原始 Z 中取出 索引为 i 的 jacobi 块, shape: (B, J, C)
+                pos_embed_sub = self.pos_embed[(i * hyper_paras.jacobi_size):((i + 1) * hyper_paras.jacobi_size)
+                                               ]  # 从位置编码中取出 第 i 个 jacobi 块对应的位置编码, shape: (J, C_hidden)
+                x_curr_sub = x[:, (i * hyper_paras.jacobi_size + 1):((i + 1) * hyper_paras.jacobi_size + 1)
+                               ].clone()  # 从 x 中取出 索引为 i 的 jacobi 块作为 J运算的 x_current, shape: (B, J, C)
+                # NOTE 注意, z 和 x 索引为0 的行不在任何 jacobi 块中
+            # endregion
+
+            if hyper_paras.incre1 and i == 0:  # 如果是第一个 jacobi 块, 且开启了 incre1 模式
+                # BUG j 没有使用
+                for j in range(hyper_paras.jacobi_size):  # 对于每一行
+                    x_in = x[:, i: i + 1]  # BUG ? x_in 始终为 x[:,0,:], shape = (B,1,C)
+                    x = self.proj_in(x_in) + self.pos_embed[i: i + 1]  # x变成了 (B,1,C_hidden)
+                    x_alpha_cond, x_mu_cond = self._reverse_substep(x, y, jacobi_attn_mask=None, which_cache='cond')
+                    if hyper_paras.guidance > 0 and hyper_paras.guide_what:
+                        x_alpha_uncond, x_mu_uncond = self._reverse_substep(x, None, jacobi_attn_mask=None, tau=hyper_paras.tau, which_cache='uncond')
+                        if hyper_paras.annealed_guidance:
+                            w_i = (i + 1) / (L - 1) * hyper_paras.guidance
                         else:
-                            g = guidance
-                        if 'a' in guide_what:
-                            xa = xa + g * (xa - xa_u)
-                        if 'b' in guide_what:
-                            xc = xc + g * (xc - xc_u)
-                    alpha = xa[:, 0].float().exp().type(xa.dtype)  # get rid of the sequence dimension
-                    x_next[:, i + 1] = z[:, i + 1] * alpha + xc[:, 0]
-                    self.cat_kv_temp('cond')
-                    if guidance > 0 and guide_what:
-                        self.cat_kv_temp('uncond')
+                            w_i = hyper_paras.guidance
+                        if 'a' in hyper_paras.guide_what:
+                            x_alpha_cond = x_alpha_cond + w_i * (x_alpha_cond - x_alpha_uncond)
+                        if 'b' in hyper_paras.guide_what:
+                            x_mu_cond = x_mu_cond + w_i * (x_mu_cond - x_mu_uncond)
+                    scale = x_alpha_cond[:, 0].float().exp().type(x_alpha_cond.dtype)  # get rid of the sequence dimension
+                    x[:, i + 1] = z[:, i + 1] * scale + x_mu_cond[:, 0]
+                    self._cat_kv_temp('cond')
+                    if hyper_paras.guidance > 0 and hyper_paras.guide_what:
+                        self._cat_kv_temp('uncond')
                 continue
 
+            # 设置迭代阈值
             n_iter = 0
             diff = 1e6
-            iter_trace_module = []
 
-            while (n_iter < max_jacobi) and (diff > ebound):
-                if last:
-                    x_next_sub = x_next[:, -jacobi_size:-1].clone()
+            while (n_iter < hyper_paras.max_jacobi) and (diff > hyper_paras.ebound):  # 当满足迭代条件时, 进行迭代计算
+                # region 使用 x_current 计算 x_next
+
+                # 由于最后一个 jacobi 块的形状不确定, 根据是否为最后一个jacobi块初始化 x_next
+                # 为方便讨论, x_next 的shape 统一记为 (B, J, C)
+                if is_last_jacobi_chunk:
+                    x_next = x[:, -hyper_paras.jacobi_size:-1].clone()
                 else:
-                    x_next_sub = x_next[:, (i * jacobi_size):((i + 1) * jacobi_size)].clone()
-                x_next_sub = self.proj_in(x_next_sub) + pos_embed_sub
+                    x_next = x[:, (i * hyper_paras.jacobi_size):((i + 1) * hyper_paras.jacobi_size), :].clone()
 
-                xa, xc = self._reverse_substep(x_next_sub, y, jacobi_attn_mask, which_cache='cond')
-                if guidance > 0 and guide_what:
-                    xa_u, xc_u = self._reverse_substep(x_next_sub, None, jacobi_attn_mask, attn_temp, which_cache='uncond')
-                    if annealed_guidance:
-                        if last:
-                            g = torch.arange(L - jacobi_size + 1, L, device=z.device) / (L - 1) * guidance
+                x_next = self.proj_in(x_next) + pos_embed_sub  # shape: (B, J, C_hidden)
+
+                # 条件引导
+                # BUG
+                # x_next.shape: (B, J, C_hidden)
+                # jacobi_attn_mask.shape: (J, (i+1)J)
+                x_alpha_cond, x_mu_cond = self._reverse_substep(x_next, y, jacobi_attn_mask, which_cache='cond')
+
+                # 非条件引导
+                if hyper_paras.no_classification_guide:
+                    x_alpha_uncond, x_mu_uncond = self._reverse_substep(x_next, None, jacobi_attn_mask, hyper_paras.tau, which_cache='uncond')
+
+                    # 确定引导权重 w_i
+                    if hyper_paras.annealed_guidance:
+                        if is_last_jacobi_chunk:
+                            w_i = torch.arange(L - hyper_paras.jacobi_size + 1, L, device=z.device) / (L - 1) * hyper_paras.guidance
                         else:
-                            g = torch.arange(i * jacobi_size + 1, (i + 1) * jacobi_size + 1, device=z.device) / (L - 1) * guidance
-                        g = g.view(1, len(g), 1)
+                            w_i = torch.arange(i * hyper_paras.jacobi_size + 1, (i + 1) *
+                                               hyper_paras.jacobi_size + 1, device=z.device) / (L - 1) * hyper_paras.guidance
+                        w_i = w_i.view(1, len(w_i), 1)
                     else:
-                        g = guidance
-                    if 'a' in guide_what:
-                        xa = xa + g * (xa - xa_u)
-                    if 'c' in guide_what:
-                        xc = xc + g * (xc - xc_u)
-                alpha = xa.float().exp().type(xa.dtype)
-                gamma = xc
-                x_next_sub = alpha * z_sub + gamma
-                x_next_sub = torch.clamp(x_next_sub, min=-3, max=3)
+                        w_i = hyper_paras.guidance
+                    # 非条件引导
+                    if 'a' in hyper_paras.guide_what:
+                        x_alpha_cond = x_alpha_cond + w_i * (x_alpha_cond - x_alpha_uncond)
+                    if 'b' in hyper_paras.guide_what:
+                        x_mu_cond = x_mu_cond + w_i * (x_mu_cond - x_mu_uncond)
+                scale = x_alpha_cond.float().exp().type(x_alpha_cond.dtype)
+                x_next = (scale * z_sub + x_mu_cond).clamp(-3, 3)
 
-                if last:
-                    x_next[:, -(jacobi_size - 1):] = x_next_sub
-                    # if show_trace:
-                    #     iter_trace_module.append((torch.norm(X_target[:, -(jacobi_size - 1):] - \
-                    #                                 x_next_sub).item()) / (B * x_next_sub.size(1) * C))
-                    #     print(n_iter)
+                # 更新 z_next
+                if is_last_jacobi_chunk:
+                    x[:, -(hyper_paras.jacobi_size - 1):] = x_next
                 else:
-                    x_next[:, (i * jacobi_size + 1):((i + 1) * jacobi_size + 1)] = x_next_sub
-                    # if show_trace:
-                    #     iter_trace_module.append(
-                    #         (torch.norm(X_target[:, (i * jacobi_size + 1):((i + 1) * jacobi_size + 1)] - x_next_sub).item()) / (B * x_next_sub.size(1) * C))
-                    #     print(n_iter)
-
-                diff = torch.norm(x_next_sub - x_curr_sub) / (B * C)
+                    x[:, (i * hyper_paras.jacobi_size + 1):((i + 1) * hyper_paras.jacobi_size + 1)] = x_next
+                # endregion
+                diff = torch.norm(x_next - x_curr_sub) / (B * C)
                 n_iter = n_iter + 1
-                x_curr_sub = x_next_sub
-            # if show_trace:
-            #     iter_trace.append(iter_trace_module)
-            self.cat_kv_temp('cond')
-            if guidance > 0 and guide_what:
-                self.cat_kv_temp('uncond')
-        return x_next  # shape: (B, L, C)  # 返回逆运算后的结果
-        pass
+                x_curr_sub = x_next
+            self._cat_kv_temp('cond')
+            if hyper_paras.guidance > 0 and hyper_paras.guide_what:
+                self._cat_kv_temp('uncond')
+        return x  # shape: (B, L, C)  # 返回逆运算后的结果
 
-    def cat_kv_temp(self, which_cache: str = 'cond'):
+    def _cat_kv_temp(self, which_cache: str = 'cond'):
         for m in self.modules():
             if isinstance(m, Attention):
-                m._k_cache[which_cache].append(m._k_cache[which_cache + '_temp'])  # type: ignore
-                m._v_cache[which_cache].append(m._v_cache[which_cache + '_temp'])  # type: ignore
+                m._k_cache[which_cache].append(m._k_gsj_cache[which_cache])  # type: ignore
+                m._v_cache[which_cache].append(m._v_gsj_cache[which_cache])  # type: ignore
 
     def _set_GSJmode(self, hyper_paras: ReverseHyperParameters, L: int):
         num_GS = hyper_paras.num_GS
+        # 若没有指定前多少行使用 GS 模式或指定全部行使用 GS 模式,
+        # 则使用 TarFlow 原本的逆运算模式,
+        # 即 GS 模式
         if num_GS < 1 or num_GS == L:
             self.GSJmode = "GS"
+        # 若仅指定第一块使用 GS 模式, 意味着全部使用 J 模式
+        # 即纯并行模式
         elif num_GS == 1:
             self.GSJmode = "J"
+        # 若指定前某些块使用 GS 模式, 意味着部分使用 GS 模式, 部分使用 J 模式
         elif num_GS > 1:
             self.GSJmode = "GSJ"
 
+        # 由于 num_GS <1 时行为和 num_GS= L 时相同, 令 num_GS = L 保持代码便于理解
         if num_GS < 1:
             hyper_paras.num_GS = L
             hyper_paras.max_jacobi = 1
 
+        # 计算 $$J_L$$
         jacobi_size = L // num_GS
-        return hyper_paras, jacobi_size
+        hyper_paras.jacobi_size = jacobi_size
+        return hyper_paras

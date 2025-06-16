@@ -66,7 +66,7 @@ def main(args):
                            nvp=args.nvp,
                            num_classes=num_classes,
                            )
-    model = transformer_flow.Model(
+    model = transformer_flow.TarFlow(
         config
     ).to('cuda')
     optimizer = torch.optim.AdamW(model.parameters(), betas=(0.9, 0.95), lr=args.lr, weight_decay=1e-4)

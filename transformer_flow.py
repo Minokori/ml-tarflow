@@ -8,6 +8,7 @@ from typing import TYPE_CHECKING
 import torch
 
 from config import TarflowConfig
+from nn import ReverseHyperParameters
 from nn.basemodule import *
 from nn.blockmodule import *
 from nn.metablock import MetaBlock
@@ -25,11 +26,8 @@ from nn.metablock import MetaBlock
 # H * D =C
 # C_hidden: 隐藏层通道数
 
-class Model(torch.nn.Module):
+class TarFlow(torch.nn.Module):
     """TarFlow模型"""
-
-    VAR_LR: float = 0.1
-    """更新先验分布时的学习率"""
 
     if TYPE_CHECKING:
         def __call__(self,
@@ -72,7 +70,6 @@ class Model(torch.nn.Module):
         self.blocks: list[MetaBlock] = torch.nn.ModuleList(blocks)  # type: ignore
         self.register_buffer('var', torch.ones(self._config.num_patches, self._config.channels_patched))
         pass
-
 
     def patchify(self, x: torch.Tensor) -> torch.Tensor:
         r"""将输入的图片张量转为块序列张量
@@ -131,18 +128,6 @@ class Model(torch.nn.Module):
             outputs.append(x)
         return x, outputs, logdets
 
-    def update_prior(self, z: torch.Tensor):
-        """用 z^2 和 var 的插值更新
-
-        $$ var = var +  (z^2 - var) \times var_{LR} $$
-
-
-        Args:
-            z (torch.Tensor): var 的优化目标
-        """
-        z2 = (z**2).mean(dim=0)
-        self.var.lerp_(z2.detach(), weight=self.VAR_LR)
-
     def get_loss(self, z: torch.Tensor, logdets: torch.Tensor) -> torch.Tensor:
         """计算模型最终输出和其logdets的loss, 用作损失函数
 
@@ -186,6 +171,10 @@ class Model(torch.nn.Module):
         attn_temp: float = 1.0,
         annealed_guidance: bool = False,
         return_sequence: bool = False,
+        hyper_para: ReverseHyperParameters = ReverseHyperParameters(),
+        num_GS_list: list[int] | None = None,
+        max_jacobi_list: list[int] | None = None,
+        guess_list: list[int] | None = None,
     ) -> torch.Tensor | list[torch.Tensor]:
         """_summary_
 
@@ -201,14 +190,27 @@ class Model(torch.nn.Module):
         Returns:
             torch.Tensor | list[torch.Tensor]: _description_
         """
-        seq: list[torch.Tensor] = [self.unpatchify(x)]  # 要返回的张量列表(图片) ,shape = (B,C,W,W)
+
+        num_GS_list = num_GS_list or [0] * self._config.blocks_num
+        max_jacobi_list = max_jacobi_list or [0] * self._config.blocks_num
+        guess_list = guess_list or [0] * self._config.blocks_num
+
         x = x * self.var.sqrt()
-        for block in reversed(self.blocks):
-            x = block.reverse(x, y, guidance, guide_what, attn_temp, annealed_guidance)
-            seq.append(self.unpatchify(x))
+
+        for block_idx, block in enumerate(reversed(self.blocks)):
+
+            if block_idx == len(self.blocks) - 1:
+                hyper_para.incre1 = True
+            else:
+                hyper_para.incre1 = False
+
+            hyper_para.num_GS = num_GS_list[block_idx]
+            hyper_para.max_jacobi = max_jacobi_list[block_idx]
+            hyper_para.zero_guess = guess_list[block_idx]
+
+            x = block.reverse(x, y, hyper_para)
+
+
         x = self.unpatchify(x)
 
-        if not return_sequence:
-            return x
-        else:
-            return seq
+        return x

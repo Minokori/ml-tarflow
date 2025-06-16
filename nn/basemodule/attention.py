@@ -17,9 +17,11 @@ from config import AttentionConfig
 # H * D =C
 # [TODO] sample 删掉, 换成GSJmode, J是正向, GS/GSJ 是逆向
 class Attention(torch.nn.Module):
-    """注意力模块"""
-    USE_SDPA: bool = True
-    """是否使用 `Scaled Dot-Product Attention(SDPA)`, 点积注意力机制"""
+    """注意力模块
+
+    + 相比于 TarFlow 原始论文, 删除了 `forward_base()`, 默认采用点注意力机制实现
+    """
+
 
     if TYPE_CHECKING:
         def __call__(self,
@@ -90,15 +92,18 @@ class Attention(torch.nn.Module):
         self.proj = torch.nn.Linear(self._config.channels_in, self._config.channels_in)
         """投影"""
 
-        self._k_cache: dict[str, list[torch.Tensor]] = {'cond': [], 'uncond': [],
-                                                        'cond_temp': torch.tensor([]), 'uncond_temp': torch.tensor([])}  # type: ignore
+        # region 缓存 K, V 矩阵
+        self._k_cache: dict[str, list[torch.Tensor]] = {'cond': [], 'uncond': []}  # type: ignore
         """K矩阵的缓存. 仅在逆运算时使用"""
-        self._v_cache: dict[str, list[torch.Tensor]] = {'cond': [],  # type: ignore
-                                                        'uncond': [], 'cond_temp': torch.tensor([]), 'uncond_temp': torch.tensor([])}
+        self._v_cache: dict[str, list[torch.Tensor]] = {'cond': [], 'uncond': []}  # type: ignore
         """V矩阵的缓存, 仅在逆运算时使用"""
 
+        self._k_gsj_cache: dict[str, torch.Tensor] = {'cond': torch.tensor([]), 'uncond': torch.tensor([]), }
+        """K矩阵 GSJ 模式的缓存. 仅在逆运算时使用"""
+        self._v_gsj_cache: dict[str, torch.Tensor] = {'cond': torch.tensor([]), 'uncond': torch.tensor([]), }
+        """V矩阵 GSJ 模式的缓存. 仅在逆运算时使用"""
         self._GSJmode: Literal["GS", "J", "GSJ"] = "J"
-
+        # endregion
 
     @property
     def GSJmode(self) -> Literal["GS", "J", "GSJ"]:
@@ -115,7 +120,11 @@ class Attention(torch.nn.Module):
         if value not in ["GS", "J", "GSJ"]:
             raise ValueError("GSJmode must be one of 'GS', 'J', or 'GSJ'")
         self._GSJmode = value
-        self.sample = self.sample
+        # 清空缓存
+        self._k_cache = {'cond': [], 'uncond': []}
+        self._v_cache = {'cond': [], 'uncond': []}
+        self._k_gsj_cache = {'cond': torch.tensor([]), 'uncond': torch.tensor([])}
+        self._v_gsj_cache = {'cond': torch.tensor([]), 'uncond': torch.tensor([])}
 
     @cached_property
     def _sqrt_scale(self) -> float:
@@ -150,34 +159,25 @@ class Attention(torch.nn.Module):
         #   -> chunk     shape: 3 * (b, h, l, d)
         q, k, v = self.qkv(x).reshape(B, L, 3 * self._config.num_heads, -1).transpose(1, 2).chunk(3, dim=1)  # (b, h, l, d)
 
-
-        # 逆运算时,计算 attention 时的 mask 为空, 使用缓存的kv矩阵计算
-        if self.sample:
-            self._k_cache[which_cache].append(k)
-            self._v_cache[which_cache].append(v)
-            # shape: (i+1) * (B,h,1,d)
-            k = torch.cat(self._k_cache[which_cache], dim=2)
-            v = torch.cat(self._v_cache[which_cache], dim=2)
-            # shape: (b, h, i+1, d)
-            # region NOTE
-            # k 缓存和 v 缓存在逆运算之前清空, 逆运算是对输入x(B, L, C) 按行计算
-            # 每次逆计算时, 输入的是 x_i (B,1,C), i 是序列元素的索引, 0 <= i < L
-            # 计算 x_i 时, k/v 缓存中各存储了 i 个 k/v, 每个 shape: (B,h,1,d)
-            # 计算 x_i 后, k,v 缓存中各存储了 i+1 个 k/v
-            # 最后一次逆计算时, i= L-1, torch.cat() 后 shape: (B,h,L,d)
-            # endregion
-
+        # 逆运算时才使用
         match self.GSJmode:
-            case "GSJ":  # 逆运算, 每次 forward 传入的
-                self._k_cache[which_cache + "_temp"] = k  # type: ignore
-                self._v_cache[which_cache + "_temp"] = v  # type: ignore
+            case "GSJ":  # 逆运算, 每次 forward 传入的  # GSJ 模式传入的mask shape = (J,(i+1)J )
 
-                if (len(self._k_cache[which_cache]) == 0):
-                    k = self._k_cache[which_cache + '_temp']
-                    v = self._v_cache[which_cache + '_temp']
+                # len =
+                self._k_gsj_cache[which_cache] = k  # shape (B, h, J, d)
+                self._v_gsj_cache[which_cache] = v  # shape (B, h, J, d)
+
+                jacobi_block_idx = len(self._k_cache[which_cache])
+
+                if (jacobi_block_idx == 0):  # 索引为 0 的 Jacobi块 的输入, kv shape = (B, h, J, d)
+                    k = self._k_gsj_cache[which_cache]
+                    v = self._v_gsj_cache[which_cache]
                 else:
-                    k = torch.cat([torch.cat(self._k_cache[which_cache], dim=2), self._k_cache[which_cache + '_temp']], dim=2)  # type: ignore
-                    v = torch.cat([torch.cat(self._v_cache[which_cache], dim=2), self._v_cache[which_cache + '_temp']], dim=2)  # type: ignore
+                    k = torch.cat([torch.cat(self._k_cache[which_cache], dim=2), self._k_gsj_cache[which_cache]], dim=2)
+                    v = torch.cat([torch.cat(self._v_cache[which_cache], dim=2), self._v_gsj_cache[which_cache]], dim=2)
+                    # torch.cat 内的 第一个 torch.cat 结果: shape  = (B, h, J*i, d)
+                    # torch.cat 内的 第二部分 shape = (B, h, J, d)
+                    # torch.cat 的结果: (B, h, J*(i+1), d)
 
             case "GS":
                 self._k_cache[which_cache].append(k)
@@ -210,30 +210,7 @@ class Attention(torch.nn.Module):
         x = self.proj(x)  # shape: (b, l, c)
         return x
 
-    def _forward_base(
-        self, x: torch.Tensor, mask: torch.Tensor | None = None, temp: float = 1.0, which_cache: str = 'cond'
-    ) -> torch.Tensor:
-        B, T, C = x.size()
-        x = self.norm(x.float()).type(x.dtype)
-        q, k, v = self.qkv(x).reshape(B, T, 3 * self._config.num_heads, -1).chunk(3, dim=2)
-        if self.sample:
-            self._k_cache[which_cache].append(k)
-            self._v_cache[which_cache].append(v)
-            k = torch.cat(self._k_cache[which_cache], dim=1)
-            v = torch.cat(self._v_cache[which_cache], dim=1)
-
-        attn = torch.einsum('bmhd,bnhd->bmnh', q * self._sqrt_scale, k * self._sqrt_scale) / temp
-        if mask is not None:
-            attn = attn.masked_fill(mask.unsqueeze(-1) == 0, float('-inf'))
-        attn = attn.float().softmax(dim=-2).type(attn.dtype)
-        x = torch.einsum('bmnh,bnhd->bmhd', attn, v)
-        x = x.reshape(B, T, C)
-        x = self.proj(x)
-        return x
-
     def forward(
         self, x: torch.Tensor, mask: torch.Tensor | None = None, tau: float = 1.0, which_cache: Literal["cond", "uncond"] = 'cond'
     ) -> torch.Tensor:
-        if self.USE_SDPA:
-            return self._forward_sdpa(x, mask, tau, which_cache)
-        return self._forward_base(x, mask, tau, which_cache)
+        return self._forward_sdpa(x, mask, tau, which_cache)

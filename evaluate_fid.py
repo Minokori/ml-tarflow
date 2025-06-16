@@ -45,7 +45,7 @@ def main(args):
                            nvp=args.nvp,
                            num_classes=num_classes,
                            )
-    model = transformer_flow.Model(
+    model = transformer_flow.TarFlow(
         config
     ).to('cuda')
     for p in model.parameters():

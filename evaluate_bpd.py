@@ -2,13 +2,13 @@ import argparse
 import os
 import pathlib
 
-from config import TarflowConfig
 import numpy as np
 import torch
 import torch.utils.data
 import torchvision as tv
 
 import transformer_flow
+from config import TarflowConfig
 
 
 def gaussian_log_prob(z: torch.Tensor, k: int = 128) -> torch.Tensor:
@@ -50,7 +50,7 @@ def main(args):
                            nvp=args.nvp,
                            num_classes=args.num_classes,
                            )
-    model = transformer_flow.Model(config)
+    model = transformer_flow.TarFlow(config)
 
     ckpt_file = args.ckpt_file
     ckpt = torch.load(ckpt_file, map_location="cpu")

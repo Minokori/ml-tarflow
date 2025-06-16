@@ -26,12 +26,16 @@ class ReverseHyperParameters():
     # GSJ paper 引入的超参数
 
     num_GS: int = 1
-
+    """jacobi 块的块数. 有 `num_GS * jacobi_size = L` ."""
     max_jacobi: int = 100
     """最大 Jacobi 迭代次数."""
     zero_guess: int = 0
     ebound: float = 1e-8
+    incre1: bool = False
+    """只有在第一个block时为true"""
 
+    jacobi_size: int = 0
+    """每个雅各比块有多少行"""
     @property
     def no_classification_guide(self) -> bool:
         """是否需要类别引导."""
