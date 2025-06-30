@@ -1,5 +1,5 @@
 """TarFlow 的 MetaBlock 模块. TarFlow的核心架构为多个 MetaBlock串联"""
-from typing import TYPE_CHECKING, Literal
+from typing import TYPE_CHECKING, Callable, Literal
 
 import torch
 
@@ -9,7 +9,7 @@ from nn.basemodule import *
 from nn.blockmodule import *
 
 
-# 符号说明:
+# region 符号说明:
 # B: 批量大小 batch size
 # L: 序列长度 (sequence length)
 # C: 通道数 (channel size)
@@ -17,13 +17,12 @@ from nn.blockmodule import *
 # D: 每个注意力头的维度 (dimension of each attention head)
 # H * D =C
 # C_hidden: 隐藏层通道数
+# endregion
 
 class MetaBlock(torch.nn.Module):
     """
-
     + 相较于 TarFlow 删除 NVP 相关设置, 默认启用 NVP
     """
-    # attn_mask
     # region TYPR_CHECKING
     if TYPE_CHECKING:
         def proj_in(self, x: torch.Tensor) -> torch.Tensor:
@@ -41,6 +40,7 @@ class MetaBlock(torch.nn.Module):
             """
             ...
 
+
         def proj_out(self, x: torch.Tensor) -> torch.Tensor:
             r"""线性投影层(out).
 
@@ -56,7 +56,7 @@ class MetaBlock(torch.nn.Module):
             """
             ...
 
-        def __call__(self, x: torch.Tensor, logdet: torch.Tensor | None = None) -> tuple[torch.Tensor, torch.Tensor, dict[str, list[torch.Tensor]]]:
+        def __call__(self, x: torch.Tensor, y: torch.Tensor | None = None) -> tuple[torch.Tensor, torch.Tensor, dict[str, list[torch.Tensor]]]:
             """前向传播
 
             Args:
@@ -64,7 +64,9 @@ class MetaBlock(torch.nn.Module):
                 y (torch.Tensor | None, optional): 输入张量的标签, shape: (B). Defaults to None.
 
             Returns:
-                tuple[torch.Tensor, torch.Tensor]: 输出张量, shape: (B, L, C), 本层雅可比行列式的 log 值, shape: (B)
+                tuple[torch.Tensor, torch.Tensor]: 输出张量, shape: (B, L, C), 本层雅可比行列式的 log 值, shape: (B), 其他信息(字典)
+
+                字典的 key : "IGN":[z,z0], "CRN".
             """
             ...
 
@@ -100,7 +102,7 @@ class MetaBlock(torch.nn.Module):
         self.attn_blocks: list[AttentionBlock] = torch.nn.ModuleList(
             [AttentionBlock(self._config.AttentionBlockConfig)
              for _ in range(self._config.num_layers)])  # type: ignore
-        self.proj_out = torch.nn.Linear(self._config.channels_hidden, self._config.channels_in * (1 + self._config.nvp))
+        self.proj_out = torch.nn.Linear(self._config.channels_hidden, self._config.channels_in * 2)
         self.proj_out.weight.data.fill_(0.0)
         self.permutation: Permutation = permutation
         """置换操作块."""
@@ -117,12 +119,15 @@ class MetaBlock(torch.nn.Module):
     # region properties
     @property
     def pos_embed(self) -> torch.Tensor:
-        """shape: (L, C_hidden)
+        """**置换后**的位置编码矩阵, 每次 forward 时, 会自动计算
 
-        Returns:
-            permutatedpos_embed_matrix (torch.Tensor): 置换后的 pos_embed_matrix
+        shape: (L, C_hidden)
+
+
+
+        ** 在 forward 最后记得将其置为 `None` **
         """
-        if not self._pos_embed:
+        if self._pos_embed is None:
             self._pos_embed = self.permutation(self.pos_embed_matrix, dim=0)
         return self._pos_embed
 
@@ -135,13 +140,21 @@ class MetaBlock(torch.nn.Module):
 
     @property
     def GSJmode(self) -> Literal["GS", "J", "GSJ"]:
+        """GSJ 模式
+
+        - "GS": TarFlow 的原始逆运算方式
+        - "J": GSJ 论文的 **纯并行** 逆运算方式
+        - "GSJ": GSJ 论文的 **混合** 逆运算方式
+
+        注意, forward 时, 该属性为 "J"
+        """
         return self._GSJmode
 
     @GSJmode.setter
     def GSJmode(self, value: Literal["GS", "J", "GSJ"]):
         """设置 GSJ 模式.
 
-        在设置时, 会改变内部所有 Attention 模块的 GSJmode 属性.
+        在设置时, 会改变内部所有 `Attention` 模块的 GSJmode 属性, 并清空其缓存
 
         Args:
             value (Literal["GS", "J", "GSJ"]): GSJ 模式
@@ -155,7 +168,7 @@ class MetaBlock(torch.nn.Module):
 
     # endregion
 
-    def forward(self, x: torch.Tensor, y: torch.Tensor | None = None) -> tuple[torch.Tensor, torch.Tensor, dict[str, list[torch.Tensor]]]:
+    def forward(self, x: torch.Tensor, y: torch.Tensor | None) -> tuple[torch.Tensor, torch.Tensor, dict[str, list[torch.Tensor]]]:
         """前向传播
 
         Args:
@@ -163,13 +176,13 @@ class MetaBlock(torch.nn.Module):
             y (torch.Tensor | None, optional): 输入张量的标签, shape:(B). Defaults to None.
 
         Returns:
-            output,logdet (tuple[torch.Tensor, torch.Tensor]): 输出张量, shape: (B, L, C), 本层雅可比行列式的 log 值, shape: (B)
+            output,logdet,infoDict (tuple[torch.Tensor, torch.Tensor]): 输出张量, shape: (B, L, C), 本层雅可比行列式的 log 值, shape: (B), 一个字典, key 为 `"IGN","CRN"`
         """
         # 置换操作, 在原论文内由 $$ \pi(z) $$ 表示
         x = self.permutation(x)  # shape: (B, L, C)
 
         # 缓存x备用
-        x_hat = x  # shape: (B, L, C)
+        x_origin = x  # shape: (B, L, C)
 
         # 位置嵌入编码 + 投影 in
         x = self.proj_in(x) + self.pos_embed  # shape: (B, L, C_hidden)
@@ -181,92 +194,87 @@ class MetaBlock(torch.nn.Module):
         x = self._attention(x)
 
         # 投影 out
-        x = self.proj_out(x)  # shape: (B, L, C * (1+nvp) )
+        x = self.proj_out(x)  # shape: (B, L, 2C )
 
-        # 梯度断裂
-        x = torch.cat([torch.zeros_like(x[:, :1, :]), x[:, :-1, :]], dim=1)  # shape: (B, L, C * (1+nvp))
-        # region NOTE
-        # zeor_like  -> (B, 1,   C * (1+nvp) )
-        # x[:,:-1,:] -> (B, L-1, C * (1+nvp) )
-        # concat     -> (B, L,   C * (1+nvp) )
+        # region 梯度断裂
+        # zeor_like  -> (B, 1,   2C )
+        # x[:,:-1,:] -> (B, L-1, 2C )
+        # concat     -> (B, L,   2C )
         # 也就是令 $$f_0 = [0,...,0]^D$$
         # 参照 https://github.com/apple/ml-tarflow/issues/8 , 原作者的回复如下:
         # "The first position $$z_0$$ goes through an identity transformation
         #  and zero padding is an easy way of doing it."
         #  由于 $$z_0$$ 事实上和 attention 中的参数无关, 也因此没有梯度联系, 因此把他手动置为0,以表示这种梯度的断裂.
         # endregion
+        x = torch.cat([torch.zeros_like(x[:, :1, :]), x[:, :-1, :]], dim=1)  # shape: (B, L, 2C)
+
 
         # 把输出 $$f_i(x_{<i})$$ 拆分成两个部分: $$\alpha_i(x_{<i})$$ 和 $$\mu_i(x_{<i})$$
         x_alpha, x_mu = self._split_to_alpha_and_mu(x)
 
-        scale = (-x_alpha.float()).exp().type(x_alpha.dtype)
-        # region NOTE 计算缩放因子
-        # 原论文公式(3) $$ \odot $$ 后的部分:
-        # $$ \exp(-\alpha_i(x_{<i})) $$
-        # endregion
-
-        z = (x_hat - x_mu) * scale  # shape: (B, L, C)
-
-        # add in GSJ paper
-        d = {}
-        if self._config.detect_mode:
-            ign = self._calculateIGN(x_hat, z)
-            crn = self._calculateCRN(x_alpha, x_hat)
-            d["IGN"] = ign
-            d["CRN"] = crn
-
-        logdet = -x_alpha.mean(dim=[1, 2])  # shape: (B)
-        # region NOTE 求雅可比行列式的值
+        # region 求雅可比行列式的值
         #  原论文公式(5):
         #
         # $$ \log \big( |det(\frac{df(x)}{dx})| \big) = -\sum^{L-1}_{i = 0}\sum^{D-1}_{j =0} \alpha_i(x_{<i})_j $$
         #
         # endregion
+        logdet = -x_alpha.mean(dim=[1, 2])  # shape: (B)
 
+        # region 计算 FLOW 模型 exp 的部分
+        # 原论文公式(3) $$ \odot $$ 后的部分:
+        # $$ \exp(-\alpha_i(x_{<i})) $$
+        # endregion
+        x_alpha_temp = (-x_alpha.float()).exp().type(x_alpha.dtype)
+
+        z = (x_origin - x_mu) * x_alpha_temp  # shape: (B, L, C)
+
+        # 在 GSJ 论文中增添的部分, 用于计算 IGN 和 CRN 指数
+        info_dict: dict[str, list[torch.Tensor]] = {}
+        if self._config.detect_mode:
+            ign = self._calculateIGN(x_origin, z)
+
+            crn = self._calculateCRN(x_alpha_temp, x_origin)
+            info_dict["IGN"] = ign
+            info_dict["CRN"] = crn
+
+        # 清空 pos_embed, 以便下次forward时从下次的输入重新计算
         self.pos_embed = None  # type: ignore
 
-        return self.permutation(z, inverse=True), logdet, d
+        return self.permutation(z, inverse=True), logdet, info_dict
 
     def reverse(
-        self,x: torch.Tensor,y: torch.Tensor | None = None,
-        hyper_parameters: ReverseHyperParameters = ReverseHyperParameters(),) -> torch.Tensor:
-        """_summary_
+            self, z: torch.Tensor, y: torch.Tensor | None = None,
+            hyper_parameters: ReverseHyperParameters = ReverseHyperParameters()) -> torch.Tensor:
+        """逆运算, 根据生成的特征 `z` 还原原始输入 `x`
 
         Args:
-            x (torch.Tensor): 输入张量(序列), shape: (B, L, C)
-            y (torch.Tensor | None, optional): 输入张量对应的标签, shape:(B) Defaults to None.
-            guidance (float, optional): 引导权重 w. Defaults to 0.
-            guide_what (str, optional): _description_. Defaults to 'ab'.
-            tau (float, optional): 手动注入温度项. Defaults to 1.0.
-            annealed_guidance (bool, optional): 是否使用退火引导权重 (使固定的 w 变成动态的 w(i,L) ). Defaults to False.
+            z (torch.Tensor): 生成的特征, shape = (B,L,C)
+            y (torch.Tensor | None, optional): 原始输入 `x` 的标签. Defaults to None.
+            hyper_parameters (ReverseHyperParameters, optional): 超参数. Defaults to ReverseHyperParameters().
 
         Returns:
-            torch.Tensor: 输出张量(序列), shape: (B,L,C)
+            x (torch.Tensor): 原始输入 `x`, shape = (B,L,C)
         """
-        B, L, C = x.size()  # shape: (B, L, C)
-
         # 置换操作, 在原论文内由 $$ \pi^{-1}(z) $$ 表示
-        x = self.permutation(x)  # shape: (B, L, C)
+        z = self.permutation(z)  # shape: (B, L, C)
 
-        hyper_parameters = self._set_GSJmode(hyper_parameters, L)
+        hyper_parameters = self._set_GSJmode(hyper_parameters, z.shape[1])
 
-        # 根据zeroguess(IGM)决定采用何种方式输入 x
-        if hyper_parameters.zero_guess == 0:
-            x_to_input = x.clone()  # shape: (B, L, C)
-        else:
-            x_to_input = torch.cat([x[:, :1, :], torch.zeros_like(x[:, 1:, :])], dim=1)
+        # 根据 zeroguess(IGM) 决定采用何种方式输入 z, 是 z 或者 z0
+        z_to_input = self._zero_guess(z, hyper_parameters)
 
+        # 根据不同的逆运算方式进行对应的计算
         match self.GSJmode:
             case "GS":  # TarFlow 的原始逆运算方式
-                z = self._GS_reverse(x_to_input, y, hyper_parameters)
-                z = self.permutation(z, inverse=True)  # shape: (B, L, C)
+                x = self._GS_reverse(z_to_input, y, z, hyper_parameters)
+                x = self.permutation(x, inverse=True)  # shape: (B, L, C)
                 pass
             case "J":  # GSJ 论文的 **纯并行** 逆运算方式
-                z = self._J_reverse(x_to_input, y, x, hyper_parameters)
-                z = self.permutation(z, inverse=True)  # shape: (B, L, C)
+                x = self._J_reverse(z_to_input, y, z, hyper_parameters)
+                x = self.permutation(x, inverse=True)  # shape: (B, L, C)
             case "GSJ":  # GSJ 论文的 **混合** 逆运算方式
-                z = self._GSJ_reverse(x_to_input, y,x, hyper_paras=hyper_parameters)
-                z = self.permutation(z, inverse=True)  # shape: (B, L, C)
+                x = self._GSJ_reverse(z_to_input, y, z, hyper_parameters)
+                x = self.permutation(x, inverse=True)  # shape: (B, L, C)
 
         self.pos_embed = None  # type: ignore
         self.GSJmode = "J"
@@ -277,7 +285,7 @@ class MetaBlock(torch.nn.Module):
         """计算 IGN 指数
 
         Args:
-            x_star (torch.Tensor): X*
+            x_star (torch.Tensor): X*,
             Z (torch.Tensor): X* `forward` 计算得到的 Z
 
 
@@ -300,8 +308,8 @@ class MetaBlock(torch.nn.Module):
 
             z_alpha, z_mu = z_.chunk(2, dim=-1)
 
-            scale = (z_alpha.float()).exp().type(z_alpha.dtype)
-            res = (scale * Z + z_mu) - x_star
+            z_alpha = (z_alpha.float()).exp().type(z_alpha.dtype)
+            res = (z_alpha * Z + z_mu) - x_star
             # endregion
 
             # 在 Batch 上求平均得到平均 (L,C), 再求矩阵 (L,C) 的 norm
@@ -310,13 +318,22 @@ class MetaBlock(torch.nn.Module):
         return IGN
 
     def _calculateCRN(self, alpha: torch.Tensor, x_star: torch.Tensor) -> list[torch.Tensor]:
+        """ 计算 CRN 指数
+
+        Args:
+            alpha (torch.Tensor): _description_
+            x_star (torch.Tensor): _description_
+
+        Returns:
+            CRN和其临时参数 (list[torch.Tensor]): list[-1]是 CRN
+        """
         CRN = []
 
         # 计算 $$||{\sum}^{-1}(X)X||_2$$
-        CRN.append(torch.linalg.norm((alpha * x_star).sum(dim=0), ord=self._config.norm).item())
+        CRN.append(torch.linalg.norm((alpha * x_star).mean(dim=0), ord=self._config.norm).item())
 
         # 计算 $$||W_s||_2$$ 和 $$||W_u||_2$$
-        W: torch.Tensor = self.proj_out.weight
+        W: torch.Tensor = self.proj_out.weight  # type: ignore
         W_s, W_u = W.chunk(2, dim=0)
         CRN.append(torch.linalg.norm(W_s, ord=self._config.norm).item())
         CRN.append(torch.linalg.norm(W_u, ord=self._config.norm).item())
@@ -383,11 +400,25 @@ class MetaBlock(torch.nn.Module):
 
     # endregion
 
+    def _zero_guess(self, x: torch.Tensor, hyper_para: ReverseHyperParameters) -> torch.Tensor:
+        """ 根据zero guess(IGM) 决定采用何种方式输入 x
+
+        Args:
+            x (torch.Tensor): 本 MetaBlock 的原始输入
+            hyper_para (ReverseHyperParameters): 超参数
+
+        Returns:
+            x_to_input (torch.Tensor): x 或 [x0,0,0...]
+        """
+        if hyper_para.zero_guess == 0:
+            return x.clone()
+        else:
+            return torch.cat([x[:, :1, :], torch.zeros_like(x[:, 1:, :])], dim=1)
+
     def _reverse_substep(self,
                          x: torch.Tensor,
                          y: torch.Tensor | None = None,
                          jacobi_attn_mask: torch.Tensor | None = None,
-                         tau: float = 1.0,
                          which_cache: Literal["cond", "uncond"] = "cond",
 
                          ) -> tuple[torch.Tensor, torch.Tensor]:
@@ -397,11 +428,11 @@ class MetaBlock(torch.nn.Module):
             x (torch.Tensor): 输入X, shape = (B,L,C)
             y (torch.Tensor | None, optional): 输入的标签, shape=(B,L,C). Defaults to None.
             jacobi_attn_mask (torch.Tensor | None, optional): 注意力mask. Defaults to None.
-            attn_temp (float, optional): 注意力缩放因子. Defaults to 1.0.
+            tau (float, optional): 注意力缩放因子. Defaults to 1.0.
             which_cache (Literal[&quot;cond&quot;, &quot;uncond&quot;], optional): 使用何种缓存. Defaults to "cond".
 
         Returns:
-            逆运算的两个部分 (tuple[torch.Tensor, torch.Tensor]): x_alpha 和 x_mux_mu
+            逆运算的两个部分 (tuple[torch.Tensor, torch.Tensor]): x_alpha 和 x_mu
         """
 
         # 分类引导
@@ -412,44 +443,46 @@ class MetaBlock(torch.nn.Module):
                 x = x + self.class_embed_matrix.mean(dim=0)
 
         for block in self.attn_blocks:
-            x = block(x, jacobi_attn_mask, tau, which_cache)
+            x = block(x, jacobi_attn_mask, which_cache)  # type: ignore
 
         x = self.proj_out(x)
         x_alpha, x_mu = x.chunk(2, dim=-1)
         return x_alpha, x_mu
 
-    def _GS_reverse(self, x: torch.Tensor,
-                    y: torch.Tensor | None = None,
-                    hyper_paras: ReverseHyperParameters = ReverseHyperParameters()) -> torch.Tensor:
+    def _GS_reverse(self, z: torch.Tensor,
+                    y: torch.Tensor | None,
+                    block_origin_input: torch.Tensor,
+                    hyper_paras: ReverseHyperParameters) -> torch.Tensor:
         """GS 逆运算
         逆运算的核心步骤, 逐行计算逆运算, 每行的逆运算依赖于前一行的结果.
 
         Args:
-            x (torch.Tensor): 输入张量(序列), shape: (B, L, C)
+            z (torch.Tensor): 输入张量(序列), shape: (B, L, C)
             y (torch.Tensor | None, optional): 输入对应的标签, shape: (B,). Defaults to None.
-            hyper_paras (ReverseHyperParameters, optional): 超参数. Defaults to ReverseHyperParameters().
+            block_origin_input (torch.Tensor): 本层 metablock 逆运算时的原始输入
+            hyper_paras (ReverseHyperParameters, optional): 超参数.
 
         Returns:
             x (torch.Tensor): 逆运算后的张量(序列), shape: (B, L, C)
         """
+        L = z.size(1)  # shape: (B, L, C), L为序列长度
+        # 按行计算, 每行 shape = (B, 1, C)
+        for line_index in range(1, L, 1):  # 注意,l =1,2,3,...,L-1 共有 L-1 个元素, 这是由于 z[0] 不需要变更
 
-        L = x.size(1)  # shape: (B, L, C), L为序列长度
-        for i in range(L - 1):  # x 按行计算,每行 shape = (B, 1, C). 注意 共有 L-1 个元素, 这是由于 x[l-1] 不需要变更
-
-            x_single_line = x[:, i:i + 1, :]  # 取出索引为 i 的行, shape: (B, 1, C)
+            z_single_line = z[:, line_index:line_index + 1, :]  # 取出z[i], shape: (B, 1, C)
 
             # 位置投影
-            x_temp = self.proj_in(x_single_line) + self.pos_embed[i:i + 1, :]  # shape: (B,1,C_hidden)
+            z_single_line = self.proj_in(z_single_line) + self.pos_embed[line_index:line_index + 1, :]  # shape: (B,1,C_hidden)
 
             # 计算条件引导下的逆运算
-            x_alpha_cond, x_mu_cond = self._reverse_substep(x_temp, y, jacobi_attn_mask=None, tau=hyper_paras.tau, which_cache='cond')
+            x_alpha_cond, x_mu_cond = self._reverse_substep(z_single_line, y, jacobi_attn_mask=None, which_cache='cond')
 
             x_alpha = x_alpha_cond
             x_mu = x_mu_cond
 
             # 计算非条件引导下的逆运算 , ab 指示引导 $$\alpha(x)$$ 和 $$\mu(x)$$ 的哪部分
             if hyper_paras.no_classification_guide:
-                x_alpha_uncond, x_mu_uncond = self._reverse_substep(x_temp, None, jacobi_attn_mask=None, tau=hyper_paras.tau, which_cache='uncond')
+                x_alpha_uncond, x_mu_uncond = self._reverse_substep(z_single_line, None, jacobi_attn_mask=None, which_cache='uncond')
 
                 # 确定引导权重 w_i
                 if hyper_paras.annealed_guidance:
@@ -459,7 +492,7 @@ class MetaBlock(torch.nn.Module):
                     # $$ w_i = \frac{i+1}{L-1}w $$
                     #
                     # endregion
-                    w_i = (i + 1) / (L - 1) * hyper_paras.guidance
+                    w_i = (line_index + 1) / (L - 1) * hyper_paras.guidance
                 else:
                     w_i = hyper_paras.guidance
 
@@ -481,72 +514,75 @@ class MetaBlock(torch.nn.Module):
                 if 'b' in hyper_paras.guide_what:
                     x_mu = x_mu_cond + w_i * (x_mu_cond - x_mu_uncond)
 
-            scale = x_alpha[:, 0].float().exp().type(x_alpha.dtype)  # shape: (B, C_hidden)
+            x_alpha = x_alpha[:, 0, :].float().exp().type(x_alpha.dtype)  # shape: (B, C_hidden)
 
             # 上面计算的是第 i 行的逆运算, 替换原来的第 i 行
-            x[:, i + 1] = x[:, i + 1]* scale  + x_mu[:, 0]
-        return x  # shape: (B, L, C)  # 返回逆运算后的结果
+            z[:, line_index, :] = block_origin_input[:, line_index, :] * x_alpha + x_mu[:, 0, :]
+        return z  # shape: (B, L, C)  # 返回逆运算后的结果
 
     def _J_reverse(
             self,
-            x: torch.Tensor,
-            y: torch.Tensor | None,
             z: torch.Tensor,
-            hyper_paras: ReverseHyperParameters = ReverseHyperParameters()) -> torch.Tensor:
+            y: torch.Tensor | None,
+            block_origin_input: torch.Tensor,
+            hyper_paras: ReverseHyperParameters,
+    ) -> torch.Tensor:
         """Jacobi 逆运算
 
         Args:
-            x (torch.Tensor): 输入张量(序列) 的 Jacobi chunk, shape: (B, J, C)
+            z (torch.Tensor): 输入张量(序列) 的 Jacobi chunk, shape: (B, J, C)
             y (torch.Tensor | None): 输入张量对应的标签, shape: (B,). Defaults to None.
-            z (torch.Tensor): 本块原始输入张量(序列) 的 Jacobi chunk, shape: (B, J, C)
+            block_origin_input (torch.Tensor): 本 metablock 原始输入张量(序列) 的 Jacobi chunk, shape: (B, J, C)
             hyper_paras (ReverseHyperParameters, optional): 超参数. Defaults to ReverseHyperParameters().
+            jacobi_mask (torch.Tensor|None, optional): 计算注意力使用的遮罩. Defaults to None.
 
         Returns:
             x (torch.Tensor): shape: (B, J, C)
         """
         # 初始化
-        B, J, C = x.shape
-        x_current = x  # X迭代之前的初始值
+        B, J, C = z.shape
+        x_current = z  # x 的当前值
         iter_count = 0  # 迭代次数
         diff = 1e6  # 差值, 用于判断迭代是否收敛
 
         # 当未满足迭代停止条件和收敛条件时, 使用 x_current 反复更新 x_next
         while iter_count < hyper_paras.max_jacobi and diff > hyper_paras.ebound:
 
-            # region 用 x_current 计算 x_next, 等效于 x_next = func(x_current)
-            x_next = self.proj_in(x_current) + self.pos_embed  # shape: (B, J, C_hidden)
+            x_next = self._J_in_while(x_current, y, self.attn_mask, self.pos_embed, block_origin_input, hyper_paras, True)
+            # # region 用 z_current 计算 z_next, 等效于 z_next = func(z_current)
+            # x_next = self.proj_in(x_current) + self.pos_embed  # shape: (B, J, C_hidden)
 
-            # 分类引导
-            x_alpha_cond, x_mu_cond = self._reverse_substep(x_next, y, jacobi_attn_mask=self.attn_mask, tau=hyper_paras.tau, which_cache='cond')
+            # # 分类引导
+            # x_alpha_cond, x_mu_cond = self._reverse_substep(x_next, y, self.attn_mask, which_cache='cond')
 
-            x_alpha = x_alpha_cond
-            x_mu = x_mu_cond
+            # x_alpha = x_alpha_cond
+            # x_mu = x_mu_cond
 
-            if hyper_paras.guidance > 0 and hyper_paras.guide_what:
-                x_alpha_uncond, x_mu_uncond = self._reverse_substep(
-                    x_next, None, jacobi_attn_mask=self.attn_mask, tau=hyper_paras.tau, which_cache='cond')
+            # if hyper_paras.no_classification_guide:
+            #     x_alpha_uncond, x_mu_uncond = self._reverse_substep(x_next, None, self.attn_mask, which_cache='cond')
 
-                # 确定引导权重 w_i
-                if hyper_paras.annealed_guidance:
-                    w_i: torch.Tensor = torch.arange(1, J + 1, device=z.device) / (J - 1) * hyper_paras.guidance
-                    w_i = w_i.view(1, -1, 1)
-                else:
-                    w_i = hyper_paras.guidance  # type: ignore
+            #     # 确定引导权重 w_i
+            #     if hyper_paras.annealed_guidance:
+            #         w_i: torch.Tensor = torch.arange(1, J + 1, device=block_origin_input.device) / (J - 1) * hyper_paras.guidance
+            #         w_i = w_i.view(1, -1, 1)
+            #     else:
+            #         w_i = hyper_paras.guidance  # type: ignore
 
-                # 非条件引导
-                if 'a' in hyper_paras.guide_what:
-                    x_alpha = x_alpha_cond + w_i * (x_alpha_cond - x_alpha_uncond)
-                if 'b' in hyper_paras.guide_what:
-                    x_mu = x_mu_cond + w_i * (x_mu_cond - x_mu_uncond)
+            #     # 非条件引导
+            #     if 'a' in hyper_paras.guide_what:
+            #         x_alpha = x_alpha_cond + w_i * (x_alpha_cond - x_alpha_uncond)
+            #     if 'b' in hyper_paras.guide_what:
+            #         x_mu = x_mu_cond + w_i * (x_mu_cond - x_mu_uncond)
 
-            # 把第 1 行设置为 0 (梯度截断)
-            x_alpha = torch.cat([torch.zeros_like(x_alpha[:, :1, :]), x_alpha[:, :-1, :]], dim=1)
-            x_mu = torch.cat([torch.zeros_like(x_mu[:, :1, :]), x_mu[:, :-1, :]], dim=1)
+            # # BUG 这两行在 GSJ 论文中没有体现
+            # # 保留 0-L1行,前面加一个全0行作为 完整值
+            # x_alpha = torch.cat([torch.zeros_like(x_alpha[:, :1, :]), x_alpha[:, :-1, :]], dim=1)
+            # x_mu = torch.cat([torch.zeros_like(x_mu[:, :1, :]), x_mu[:, :-1, :]], dim=1)
 
-            x_next = ((x_alpha.float().exp().type(x_alpha.dtype)) * z + x_mu).clamp(-3, 3)
-            # endregion
+            # x_next = ((x_alpha.float().exp().type(x_alpha.dtype)) * block_origin_input + x_mu).clamp(-3, 3)
+            # # endregion
 
-            # 更新 判断条件
+            # 更新判断条件
             diff = torch.linalg.norm(x_next - x_current) / (B * C)
             iter_count += 1
 
@@ -556,57 +592,48 @@ class MetaBlock(torch.nn.Module):
 
     def _GSJ_reverse(
             self,
-            x: torch.Tensor,
-            y: torch.Tensor | None,
             z: torch.Tensor,
-            hyper_paras: ReverseHyperParameters = ReverseHyperParameters(),
+            y: torch.Tensor | None,
+            block_origin_input: torch.Tensor,
+            hyper_paras: ReverseHyperParameters,
     ) -> torch.Tensor:
-        base_attn_mask = torch.tril(
-            torch.ones(
-                hyper_paras.jacobi_size,
-                hyper_paras.jacobi_size,
-                device=z.device))  # 注意力 mask, 下三角全为1的矩阵, 用于屏蔽未来的信息, shape = (J, J)
-        B, L, C = z.size()  # shape: (B, L, C)
+        """GSJ 模式逆运算
 
-        for i in range(hyper_paras.num_GS):  # 对于每个 jacobi 块, 对应原论文伪代码中的第 4 行
+        Args:
+            z (torch.Tensor): 输入, X = x | [x0,0,...], shape: (B, L, C)
+            y (torch.Tensor | None): 输入对应的标签, shape: (B,). Defaults to None.
+            block_origin_input (torch.Tensor): 本层 MetaBlock 的原始输入张量(序列), shape: (B, L, C)
+            hyper_paras (ReverseHyperParameters, optional): 超参数. Defaults to ReverseHyperParameters().
 
-            # region NOTE
-            # torch.cat 的第一部分: shape = (J, J) * i 个,
-            # torch.cat 的第二部分: 下三角矩阵, shape = (J, J)
-            # jacobi_attn_mask.shape: (J, (i+1)J )
-            # jacobi_attn_mask 的作用:
-            # 保留索引为 i 的 jacobi 块之前的块的所有信息,
-            # 对索引为 i 的 jacobi 块内的按行保留信息
-            # endregion
-            jacobi_attn_mask = torch.cat([torch.ones(hyper_paras.jacobi_size, hyper_paras.jacobi_size, device=z.device)]
-                                         * i + [base_attn_mask], dim=1)
+        Returns:
+            x (torch.Tensor): 输出, 逆运算后的张量(序列), shape: (B, L, C)
+        """
 
-            # 判断该行是不是最后一个 jacobi 块. 最后一个 jacobi 块长度可能不为 J
-            is_last_jacobi_chunk: bool = (i == hyper_paras.num_GS - 1)
+        B, L, C = block_origin_input.size()  # shape: (B, L, C)
 
-            # region 初始化 每个 Jacobi 块 进行 J 运算需要的 x, z, z对应的 pos_embed
-            if is_last_jacobi_chunk:
-                z_sub = z[:, -(hyper_paras.jacobi_size - 1):, :]  # 从原始 Z 中取出 最后一个 jacobi 块, shape: (B, J, C)
-                pos_embed_sub = self.pos_embed[-hyper_paras.jacobi_size:-1]
-                x_curr_sub = x[:, -(hyper_paras.jacobi_size - 1):].clone()
-                jacobi_attn_mask = jacobi_attn_mask[:-1, :-1]  # shape: (J-1, (i+1)J-1 )
-            else:
-                z_sub = z[:, (i * hyper_paras.jacobi_size + 1):((i + 1) * hyper_paras.jacobi_size + 1),:]  # 从原始 Z 中取出 索引为 i 的 jacobi 块, shape: (B, J, C)
-                pos_embed_sub = self.pos_embed[(i * hyper_paras.jacobi_size):((i + 1) * hyper_paras.jacobi_size)
-                                               ]  # 从位置编码中取出 第 i 个 jacobi 块对应的位置编码, shape: (J, C_hidden)
-                x_curr_sub = x[:, (i * hyper_paras.jacobi_size + 1):((i + 1) * hyper_paras.jacobi_size + 1)
-                               ].clone()  # 从 x 中取出 索引为 i 的 jacobi 块作为 J运算的 x_current, shape: (B, J, C)
-                # NOTE 注意, z 和 x 索引为0 的行不在任何 jacobi 块中
-            # endregion
+        for i in range(hyper_paras.jacobi_chunk_number):  # 对于每个 jacobi 块, 对应原论文伪代码中的第 4 行
+
+            # 判断该行是不是最后一个 jacobi 块. (最后一个 jacobi 块长度可能不为 J)
+            is_last_jacobi_chunk: bool = (i == hyper_paras.jacobi_chunk_number - 1)
+
+            # 初始化索引为 i 的 jacobi 块的输入和位置嵌入
+            # z_J.shape = (B,J,C)
+            # origin_J.shape = (B,J,C)
+            # pos_embed_J.shape = (B,J,C)
+            # mask_J.shape = (J, (i+1)J)
+            z_current, origin_J, pos_embed_J, mask_J = self._init_paras_for_Jchunk(i, z, block_origin_input, hyper_paras)
 
             if hyper_paras.incre1 and i == 0:  # 如果是第一个 jacobi 块, 且开启了 incre1 模式
+
+                # 功能: x_to_input -> fn(x_to_input)
                 # BUG j 没有使用
                 for j in range(hyper_paras.jacobi_size):  # 对于每一行
-                    x_in = x[:, i: i + 1]  # BUG ? x_in 始终为 x[:,0,:], shape = (B,1,C)
-                    x = self.proj_in(x_in) + self.pos_embed[i: i + 1]  # x变成了 (B,1,C_hidden)
-                    x_alpha_cond, x_mu_cond = self._reverse_substep(x, y, jacobi_attn_mask=None, which_cache='cond')
+                    x_in = z[:, i: i + 1]  # BUG ? x_in 始终为 x[:,0,:], shape = (B,1,C)
+                    x_temp = self.proj_in(x_in) + self.pos_embed[i: i + 1]  # x变成了 (B,1,C_hidden)
+                    x_alpha_cond, x_mu_cond = self._reverse_substep(x_temp, y, None, which_cache='cond')
+
                     if hyper_paras.guidance > 0 and hyper_paras.guide_what:
-                        x_alpha_uncond, x_mu_uncond = self._reverse_substep(x, None, jacobi_attn_mask=None, tau=hyper_paras.tau, which_cache='uncond')
+                        x_alpha_uncond, x_mu_uncond = self._reverse_substep(x_temp, None, jacobi_attn_mask=None, which_cache='uncond')
                         if hyper_paras.annealed_guidance:
                             w_i = (i + 1) / (L - 1) * hyper_paras.guidance
                         else:
@@ -615,8 +642,8 @@ class MetaBlock(torch.nn.Module):
                             x_alpha_cond = x_alpha_cond + w_i * (x_alpha_cond - x_alpha_uncond)
                         if 'b' in hyper_paras.guide_what:
                             x_mu_cond = x_mu_cond + w_i * (x_mu_cond - x_mu_uncond)
-                    scale = x_alpha_cond[:, 0].float().exp().type(x_alpha_cond.dtype)  # get rid of the sequence dimension
-                    x[:, i + 1] = z[:, i + 1] * scale + x_mu_cond[:, 0]
+                    x_alpha = x_alpha_cond[:, 0].float().exp().type(x_alpha_cond.dtype)  # get rid of the sequence dimension
+                    z[:, i + 1] = block_origin_input[:, i + 1] * x_alpha + x_mu_cond[:, 0]
                     self._cat_kv_temp('cond')
                     if hyper_paras.guidance > 0 and hyper_paras.guide_what:
                         self._cat_kv_temp('uncond')
@@ -626,68 +653,71 @@ class MetaBlock(torch.nn.Module):
             n_iter = 0
             diff = 1e6
 
+            # while 块的工作原理和 J revese 相同
+            # 输入: x_current, pos_embed , 输出 x_next
             while (n_iter < hyper_paras.max_jacobi) and (diff > hyper_paras.ebound):  # 当满足迭代条件时, 进行迭代计算
+
+                z_next = self._J_in_while(z_current, y, mask_J, pos_embed_J, origin_J, hyper_paras, False)
+
                 # region 使用 x_current 计算 x_next
 
                 # 由于最后一个 jacobi 块的形状不确定, 根据是否为最后一个jacobi块初始化 x_next
                 # 为方便讨论, x_next 的shape 统一记为 (B, J, C)
-                if is_last_jacobi_chunk:
-                    x_next = x[:, -hyper_paras.jacobi_size:-1].clone()
-                else:
-                    x_next = x[:, (i * hyper_paras.jacobi_size):((i + 1) * hyper_paras.jacobi_size), :].clone()
-
-                x_next = self.proj_in(x_next) + pos_embed_sub  # shape: (B, J, C_hidden)
+                z_next = self.proj_in(z_current) + pos_embed_J  # shape: (B, J, C_hidden)
 
                 # 条件引导
-                # BUG
-                # x_next.shape: (B, J, C_hidden)
-                # jacobi_attn_mask.shape: (J, (i+1)J)
-                x_alpha_cond, x_mu_cond = self._reverse_substep(x_next, y, jacobi_attn_mask, which_cache='cond')
+                x_alpha_cond, x_mu_cond = self._reverse_substep(z_next, y, mask_J, which_cache='cond')
+
+                x_alpha = x_alpha_cond
+                x_mu = x_mu_cond
 
                 # 非条件引导
                 if hyper_paras.no_classification_guide:
-                    x_alpha_uncond, x_mu_uncond = self._reverse_substep(x_next, None, jacobi_attn_mask, hyper_paras.tau, which_cache='uncond')
+                    x_alpha_uncond, x_mu_uncond = self._reverse_substep(z_next, None, mask_J, which_cache='uncond')
 
                     # 确定引导权重 w_i
                     if hyper_paras.annealed_guidance:
                         if is_last_jacobi_chunk:
-                            w_i = torch.arange(L - hyper_paras.jacobi_size + 1, L, device=z.device) / (L - 1) * hyper_paras.guidance
+                            w_i = torch.arange(L - hyper_paras.jacobi_size + 1, L, device=block_origin_input.device) / (L - 1) * hyper_paras.guidance
                         else:
+                            # shape = (i*J+1, (i+1)J + 1)
                             w_i = torch.arange(i * hyper_paras.jacobi_size + 1, (i + 1) *
-                                               hyper_paras.jacobi_size + 1, device=z.device) / (L - 1) * hyper_paras.guidance
+                                               hyper_paras.jacobi_size + 1, device=block_origin_input.device) / (L - 1) * hyper_paras.guidance
                         w_i = w_i.view(1, len(w_i), 1)
                     else:
                         w_i = hyper_paras.guidance
                     # 非条件引导
                     if 'a' in hyper_paras.guide_what:
-                        x_alpha_cond = x_alpha_cond + w_i * (x_alpha_cond - x_alpha_uncond)
+                        x_alpha = x_alpha_cond + w_i * (x_alpha_cond - x_alpha_uncond)
                     if 'b' in hyper_paras.guide_what:
-                        x_mu_cond = x_mu_cond + w_i * (x_mu_cond - x_mu_uncond)
-                scale = x_alpha_cond.float().exp().type(x_alpha_cond.dtype)
-                x_next = (scale * z_sub + x_mu_cond).clamp(-3, 3)
+                        x_mu = x_mu_cond + w_i * (x_mu_cond - x_mu_uncond)
+
+                x_alpha = x_alpha.float().exp().type(x_alpha.dtype)
+                z_next = (x_alpha * origin_J + x_mu).clamp(-3, 3)
 
                 # 更新 z_next
                 if is_last_jacobi_chunk:
-                    x[:, -(hyper_paras.jacobi_size - 1):] = x_next
+                    z[:, -(hyper_paras.jacobi_size - 1):] = z_next
                 else:
-                    x[:, (i * hyper_paras.jacobi_size + 1):((i + 1) * hyper_paras.jacobi_size + 1)] = x_next
+                    z[:, (i * hyper_paras.jacobi_size + 1):((i + 1) * hyper_paras.jacobi_size + 1)] = z_next
                 # endregion
-                diff = torch.norm(x_next - x_curr_sub) / (B * C)
+                diff = torch.norm(z_next - z_current) / (B * C)
                 n_iter = n_iter + 1
-                x_curr_sub = x_next
+                z_current = z_next
+
+            # 更新缓存
             self._cat_kv_temp('cond')
             if hyper_paras.guidance > 0 and hyper_paras.guide_what:
                 self._cat_kv_temp('uncond')
-        return x  # shape: (B, L, C)  # 返回逆运算后的结果
+        return z  # shape: (B, L, C)  # 返回逆运算后的结果
 
-    def _cat_kv_temp(self, which_cache: str = 'cond'):
+    def _cat_kv_temp(self, which_cache: Literal["cond", "uncond"] = 'cond'):
         for m in self.modules():
             if isinstance(m, Attention):
-                m._k_cache[which_cache].append(m._k_gsj_cache[which_cache])  # type: ignore
-                m._v_cache[which_cache].append(m._v_gsj_cache[which_cache])  # type: ignore
+                m.cat_kv_temp(which_cache)
 
     def _set_GSJmode(self, hyper_paras: ReverseHyperParameters, L: int):
-        num_GS = hyper_paras.num_GS
+        num_GS = hyper_paras.jacobi_chunk_number
         # 若没有指定前多少行使用 GS 模式或指定全部行使用 GS 模式,
         # 则使用 TarFlow 原本的逆运算模式,
         # 即 GS 模式
@@ -703,10 +733,111 @@ class MetaBlock(torch.nn.Module):
 
         # 由于 num_GS <1 时行为和 num_GS= L 时相同, 令 num_GS = L 保持代码便于理解
         if num_GS < 1:
-            hyper_paras.num_GS = L
+            hyper_paras.jacobi_chunk_number = L
             hyper_paras.max_jacobi = 1
 
         # 计算 $$J_L$$
-        jacobi_size = L // num_GS
+        jacobi_size = L // num_GS if num_GS !=0 else 1
         hyper_paras.jacobi_size = jacobi_size
         return hyper_paras
+
+    def _init_paras_for_Jchunk(self,
+                               i: int,
+                               z: torch.Tensor,
+                               block_origin_input: torch.Tensor,
+                               hyper_paras: ReverseHyperParameters) -> tuple[torch.Tensor,
+                                                                             torch.Tensor,
+                                                                             torch.Tensor,
+                                                                             torch.Tensor]:
+        """初始化用于 J 模式的参数
+
+        Args:
+            i (int): Jacobi 块的索引
+            z (torch.Tensor): 输入张量(序列), shape: (B, L, C)
+            block_origin_input (torch.Tensor): 本层 MetaBlock 的原始输入张量(序列), shape: (B, L, C)
+            hyper_paras (ReverseHyperParameters): 超参数
+
+        Returns:
+            用于 J 模式的参数 (torch.Tensor): x_current, z, pos_embed, mask
+        """
+        J = hyper_paras.jacobi_size  # 每个 Jacobi 块的大小
+
+        one_mask = torch.ones(J, J, device=block_origin_input.device)  # 全 1 矩阵, shape = (J, J)
+        base_attn_mask = torch.tril(one_mask)  # 注意力 mask, 下三角全为1的矩阵, 用于屏蔽未来的信息, shape = (J, J)
+
+        # region 生成 mask
+        # torch.cat 的第一部分: shape = (J, J) * i 个,
+        # torch.cat 的第二部分: 下三角矩阵, shape = (J, J)
+        # jacobi_attn_mask.shape: (J, (i+1)J )
+        # jacobi_attn_mask 的作用:
+        # 保留索引为 i 的 jacobi 块之前的块的所有信息,
+        # 对索引为 i 的 jacobi 块内的按行保留信息
+        # endregion
+        mask_Jchunk = torch.cat([one_mask] * i + [base_attn_mask], dim=1)  # shape: (J, (i+1)J)
+
+        # 判断该行是不是最后一个 jacobi 块. 最后一个 jacobi 块长度可能不为 J
+        is_last_jacobi_chunk: bool = (i == hyper_paras.jacobi_chunk_number - 1)
+
+        # region 初始化 每个 Jacobi 块 进行 J 运算需要的 z, block origin input, z对应的 pos_embed
+        # 1. 从原始 Z 中取出 索引为 i 的 jacobi 块, shape: (B, J, C)
+        # 2. 从位置编码中取出 第 i 个 jacobi 块对应的位置编码, shape: (J, C_hidden)
+        # 3. 从 x 中取出 索引为 i 的 jacobi 块作为 J 运算的 x_current, shape: (B, J, C)
+        # 4. (可选) 如果是最后一个 jacobi 块, 设置 jacobi_attn_mask 的形状为
+        if is_last_jacobi_chunk:
+            origin_Jchunk = block_origin_input[:, -(J - 1):, :]  # 从原始 Z 中取出 最后一个 jacobi 块, shape: (B, J, C)
+            pos_embed_chunk = self.pos_embed[-J:-1]
+            z_Jchunk = z[:, -(J - 1):].clone()
+            mask_Jchunk = mask_Jchunk[:-1, :-1]  # shape: (J-1, (i+1)J-1 )
+        else:
+            origin_Jchunk = block_origin_input[:, (i * J + 1):((i + 1) * J + 1), :]  # 从原始 Z 中取出 索引为 i 的 jacobi 块, shape: (B, J, C)
+            pos_embed_chunk = self.pos_embed[(i * J):((i + 1) * J)
+                                             ]  # 从位置编码中取出 第 i 个 jacobi 块对应的位置编码, shape: (J, C_hidden)
+            z_Jchunk = z[:, (i * J + 1):((i + 1) * J + 1)].clone()  # 从 x 中取出 索引为 i 的 jacobi 块作为 J运算的 x_current, shape: (B, J, C)
+            # NOTE 注意, 索引为0 的行不在任何 jacobi 块中
+        # endregion
+        return z_Jchunk, origin_Jchunk, pos_embed_chunk, mask_Jchunk
+
+    def _J_in_while(
+            self,
+            x_current: torch.Tensor,
+            y: torch.Tensor | None,
+            mask,
+            pos_embed: torch.Tensor,
+            origin: torch.Tensor,
+            hyper_paras: ReverseHyperParameters,
+            zreo_first_line: bool) -> torch.Tensor:
+        J = x_current.shape[1]
+        d = x_current.device
+        # 位置编码
+        x_next = self.proj_in(x_current) + pos_embed  # shape: (B, J, C_hidden)
+
+        # 分类引导
+        x_alpha_cond, x_mu_cond = self._reverse_substep(x_next, y, mask, which_cache='cond')
+
+        x_alpha = x_alpha_cond
+        x_mu = x_mu_cond
+
+        if hyper_paras.no_classification_guide:
+            x_alpha_uncond, x_mu_uncond = self._reverse_substep(x_next, None, mask, which_cache='cond')
+
+            # 确定引导权重 w_i
+            if hyper_paras.annealed_guidance:
+                w_i: torch.Tensor = torch.arange(1, J + 1, device=d) / (J - 1) * hyper_paras.guidance
+                w_i = w_i.view(1, -1, 1)
+            else:
+                w_i = hyper_paras.guidance  # type: ignore
+
+            # 非条件引导
+            if 'a' in hyper_paras.guide_what:
+                x_alpha = x_alpha_cond + w_i * (x_alpha_cond - x_alpha_uncond)
+            if 'b' in hyper_paras.guide_what:
+                x_mu = x_mu_cond + w_i * (x_mu_cond - x_mu_uncond)
+
+        if zreo_first_line:  # J 模式
+            # BUG 这两行在 GSJ 论文中没有体现
+            # 保留 0-L1行,前面加一个全0行作为 完整值
+            x_alpha = torch.cat([torch.zeros_like(x_alpha[:, :1, :]), x_alpha[:, :-1, :]], dim=1)
+            x_mu = torch.cat([torch.zeros_like(x_mu[:, :1, :]), x_mu[:, :-1, :]], dim=1)
+
+        x_next = ((x_alpha.float().exp().type(x_alpha.dtype)) * origin + x_mu).clamp(-3, 3)
+        return x_next

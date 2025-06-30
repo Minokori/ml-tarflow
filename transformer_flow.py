@@ -33,7 +33,7 @@ class TarFlow(torch.nn.Module):
         def __call__(self,
                      x: torch.Tensor,
                      y: torch.Tensor | None = None
-                     ) -> tuple[torch.Tensor, list[torch.Tensor], torch.Tensor]:
+                     ) -> tuple[torch.Tensor, torch.Tensor, dict]:
             """前向传播
 
             Args:
@@ -41,7 +41,7 @@ class TarFlow(torch.nn.Module):
                 y (torch.Tensor | None, optional): 输入张量的标签, shape: (B). Defaults to None.
 
             Returns:
-                output,perlayeroutput,logdets (tuple[torch.Tensor, list[torch.Tensor], torch.Tensor]): 输出 (B, L, C*P*P), 每层的输出 , logdets (B,)
+                output,perlayeroutput,logdets,d (tuple[torch.Tensor, list[torch.Tensor], torch.Tensor,dict[str,Any]]): 输出 (B, L, C*P*P), 每层的输出 , logdets (B,)
             """
             ...
 
@@ -49,9 +49,9 @@ class TarFlow(torch.nn.Module):
         def var(self) -> torch.Tensor:
             """先验分布
 
-            `NVP` 模式下的 全为1的矩阵, 但 `VP` 模式下是可学习的参数
+            全为1的矩阵
 
-            `shape:(L,C * P * P)`
+            `shape:(L, C * P * P)`
             """
             ...
 
@@ -103,7 +103,7 @@ class TarFlow(torch.nn.Module):
         self,
         x: torch.Tensor,
         y: torch.Tensor | None = None
-    ) -> tuple[torch.Tensor, list[torch.Tensor], torch.Tensor]:
+    ) -> tuple[torch.Tensor, torch.Tensor, dict]:
         """前向传播
 
         Args:
@@ -118,15 +118,24 @@ class TarFlow(torch.nn.Module):
         # 初始化每一层的输出
         outputs: list[torch.Tensor] = []
 
+        #
+        D = {"IGN": [],
+             "CRN": []}
+
         # 初始化 雅可比行列式的 log 值
         logdets = torch.zeros((), device=x.device)  # shape: ()
+
 
         # 计算并保留每层的输出
         for block in self.blocks:
             x, logdet,d = block(x, y)  # shape: (B, L, C), (B)
             logdets = logdets + logdet
             outputs.append(x)
-        return x, outputs, logdets
+
+            if d:
+                D["IGN"].append(d["IGN"])
+                D["CRN"].append(d["CRN"])
+        return x, logdets, D
 
     def get_loss(self, z: torch.Tensor, logdets: torch.Tensor) -> torch.Tensor:
         """计算模型最终输出和其logdets的loss, 用作损失函数
@@ -166,11 +175,6 @@ class TarFlow(torch.nn.Module):
         self,
         x: torch.Tensor,
         y: torch.Tensor | None = None,
-        guidance: float = 0,
-        guide_what: str = 'ab',
-        attn_temp: float = 1.0,
-        annealed_guidance: bool = False,
-        return_sequence: bool = False,
         hyper_para: ReverseHyperParameters = ReverseHyperParameters(),
         num_GS_list: list[int] | None = None,
         max_jacobi_list: list[int] | None = None,
@@ -195,18 +199,23 @@ class TarFlow(torch.nn.Module):
         max_jacobi_list = max_jacobi_list or [0] * self._config.blocks_num
         guess_list = guess_list or [0] * self._config.blocks_num
 
+        # reverse
+        num_GS_list.reverse()
+        max_jacobi_list.reverse()
+        guess_list.reverse()
+
         x = x * self.var.sqrt()
 
-        for block_idx, block in enumerate(reversed(self.blocks)):
+        for block_revresed_idx, block in enumerate(reversed(self.blocks)):
 
-            if block_idx == len(self.blocks) - 1:
+            if block_revresed_idx == len(self.blocks) - 1:
                 hyper_para.incre1 = True
             else:
                 hyper_para.incre1 = False
 
-            hyper_para.num_GS = num_GS_list[block_idx]
-            hyper_para.max_jacobi = max_jacobi_list[block_idx]
-            hyper_para.zero_guess = guess_list[block_idx]
+            hyper_para.jacobi_chunk_number = num_GS_list[block_revresed_idx]
+            hyper_para.max_jacobi = max_jacobi_list[block_revresed_idx]
+            hyper_para.zero_guess = guess_list[block_revresed_idx]
 
             x = block.reverse(x, y, hyper_para)
 
@@ -214,3 +223,13 @@ class TarFlow(torch.nn.Module):
         x = self.unpatchify(x)
 
         return x
+
+    def set_detect_mode(self, mode: bool = True) -> None:
+        """设置模型为检测模式
+
+        Args:
+            mode (bool, optional): 是否为检测模式. Defaults to True.
+        """
+        self._config.detect_mode = mode
+        for block in self.blocks:
+            block._config.detect_mode = mode

@@ -26,14 +26,20 @@ class AttentionConfig():
     channels_per_head: int
     """每个注意力头分配的维度 `D`"""
 
+    scale: float = 0
+    """SDPA 应用于 softmax 之前的缩放因子, 默认是 1/√E, E是Q和K的维度, 也即D"""
+
     @cached_property
     def num_heads(self) -> int:
         """计算注意力头的数量 `H`"""
         return self.channels_in // self.channels_per_head
 
-    def post_init(self):
+    def __post_init__(self):
         """检查输入维度是否可以被每个注意力头分配的维度整除"""
         assert self.channels_in % self.channels_per_head == 0, f"输入维度 `{self.channels_in}` 无法被为每个注意力头分配的维度 `{self.channels_per_head}` 整除"
+
+        if self.scale == 0:
+            self.scale = (1 / self.channels_per_head ** 0.5)
 
 
 @dataclass_json
@@ -74,10 +80,10 @@ class MetaBlockConfig():
     """每个注意力头分配的通道数"""
     expansion: int = 4
     """MLP的隐藏层扩大系数."""
-    nvp: bool = True
-    """是否使用 `NVP` 模式"""
     num_classes: int = 0
     """样本类别数, 设置为 0 即为没有类别"""
+
+
     # Added in GSJ paper
     detect_mode: bool = False
     """`GSJ论文中增加的参数`, 是否为检测模式"""
@@ -98,15 +104,13 @@ class TarflowConfig():
     """输入图像的边长 `W`"""
     patch_size:int
     """图像分块的边长 `P`"""
-
     channels_hidden:int
     """MetaBlock 中的隐藏层通道数 `C_hidden`"""
     blocks_num:int
     """MetaBlock 的数量"""
     layers_per_block:int
     """MetaBlock 中 AttentionBlock 的层数"""
-    nvp:bool = True
-    """是否使用 `NVP` 模式"""
+
     num_classes:int = 0
     """分类数量, 用于引导网络训练, 设置为 0 即为没有类别"""
 
@@ -115,6 +119,12 @@ class TarflowConfig():
     """每个注意力头分配的通道数 `D`"""
     expansion = 4
     """MLP的隐藏层扩大系数."""
+
+    detect_mode: bool = False
+    """是否为检测模式, `GSJ论文中增加的参数`
+
+    是否计算输出 IGN 和 CRN
+    """
 
     @cached_property
     def num_patches(self) -> int:
@@ -126,17 +136,15 @@ class TarflowConfig():
         """输入张量被分块后的通道数, 也即每个块的通道数"""
         return self.channels_in * self.patch_size ** 2
 
-
-
-    @cached_property
-    def MetaBlockConfig(self,**kwargs) -> MetaBlockConfig:
+    @property
+    def MetaBlockConfig(self) -> MetaBlockConfig:
         return MetaBlockConfig(
             channels_in=self.channels_patched,
             channels_hidden=self.channels_hidden,
             num_patches=self.num_patches,
             num_layers=self.layers_per_block,
             channels_per_head=self.channels_per_head,
-            expansion= self.expansion,
-            nvp=self.nvp,
-            num_classes=self.num_classes
+            expansion=self.expansion,
+            num_classes=self.num_classes,
+            detect_mode=self.detect_mode
         )

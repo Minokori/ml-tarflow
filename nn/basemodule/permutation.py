@@ -24,7 +24,7 @@ class Permutation(ABC, torch.nn.Module):
         def __call__(self, x: torch.Tensor, dim: int = 1, inverse: bool = False) -> torch.Tensor:
             r"""对输入张量 `x` 进行置换操作
 
-            $$ Output_{(B,L,C)} = Permutation(Input_{(B,L,C)}) $$
+            按照某种方式打乱 `x` 的元素顺序, 并在 `inverse` 为 `True` 时能够把打乱的 `x'` 还原为 `x`.
 
                 Args:
                     x (torch.Tensor): 输入张量, shape: (B, L, C)

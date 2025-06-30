@@ -25,7 +25,7 @@ class ReverseHyperParameters():
 
     # GSJ paper 引入的超参数
 
-    num_GS: int = 1
+    jacobi_chunk_number: int = 1
     """jacobi 块的块数. 有 `num_GS * jacobi_size = L` ."""
     max_jacobi: int = 100
     """最大 Jacobi 迭代次数."""
