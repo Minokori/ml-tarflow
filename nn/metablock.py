@@ -549,38 +549,6 @@ class MetaBlock(torch.nn.Module):
         while iter_count < hyper_paras.max_jacobi and diff > hyper_paras.ebound:
 
             x_next = self._J_in_while(x_current, y, self.attn_mask, self.pos_embed, block_origin_input, hyper_paras, True)
-            # # region 用 z_current 计算 z_next, 等效于 z_next = func(z_current)
-            # x_next = self.proj_in(x_current) + self.pos_embed  # shape: (B, J, C_hidden)
-
-            # # 分类引导
-            # x_alpha_cond, x_mu_cond = self._reverse_substep(x_next, y, self.attn_mask, which_cache='cond')
-
-            # x_alpha = x_alpha_cond
-            # x_mu = x_mu_cond
-
-            # if hyper_paras.no_classification_guide:
-            #     x_alpha_uncond, x_mu_uncond = self._reverse_substep(x_next, None, self.attn_mask, which_cache='cond')
-
-            #     # 确定引导权重 w_i
-            #     if hyper_paras.annealed_guidance:
-            #         w_i: torch.Tensor = torch.arange(1, J + 1, device=block_origin_input.device) / (J - 1) * hyper_paras.guidance
-            #         w_i = w_i.view(1, -1, 1)
-            #     else:
-            #         w_i = hyper_paras.guidance  # type: ignore
-
-            #     # 非条件引导
-            #     if 'a' in hyper_paras.guide_what:
-            #         x_alpha = x_alpha_cond + w_i * (x_alpha_cond - x_alpha_uncond)
-            #     if 'b' in hyper_paras.guide_what:
-            #         x_mu = x_mu_cond + w_i * (x_mu_cond - x_mu_uncond)
-
-            # # BUG 这两行在 GSJ 论文中没有体现
-            # # 保留 0-L1行,前面加一个全0行作为 完整值
-            # x_alpha = torch.cat([torch.zeros_like(x_alpha[:, :1, :]), x_alpha[:, :-1, :]], dim=1)
-            # x_mu = torch.cat([torch.zeros_like(x_mu[:, :1, :]), x_mu[:, :-1, :]], dim=1)
-
-            # x_next = ((x_alpha.float().exp().type(x_alpha.dtype)) * block_origin_input + x_mu).clamp(-3, 3)
-            # # endregion
 
             # 更新判断条件
             diff = torch.linalg.norm(x_next - x_current) / (B * C)
@@ -657,7 +625,7 @@ class MetaBlock(torch.nn.Module):
             # 输入: x_current, pos_embed , 输出 x_next
             while (n_iter < hyper_paras.max_jacobi) and (diff > hyper_paras.ebound):  # 当满足迭代条件时, 进行迭代计算
 
-                z_next = self._J_in_while(z_current, y, mask_J, pos_embed_J, origin_J, hyper_paras, False)
+                # z_next = self._J_in_while(z_current, y, mask_J, pos_embed_J, origin_J, hyper_paras, False)
 
                 # region 使用 x_current 计算 x_next
 
@@ -818,8 +786,8 @@ class MetaBlock(torch.nn.Module):
         x_mu = x_mu_cond
 
         if hyper_paras.no_classification_guide:
-            x_alpha_uncond, x_mu_uncond = self._reverse_substep(x_next, None, mask, which_cache='cond')
-
+            x_alpha_uncond, x_mu_uncond = self._reverse_substep(x_next, None, mask, which_cache='uncond')
+            # BUG GSJ 写的是 cond, 感觉应为 uncond
             # 确定引导权重 w_i
             if hyper_paras.annealed_guidance:
                 w_i: torch.Tensor = torch.arange(1, J + 1, device=d) / (J - 1) * hyper_paras.guidance

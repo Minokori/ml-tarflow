@@ -179,7 +179,7 @@ class TarFlow(torch.nn.Module):
         num_GS_list: list[int] | None = None,
         max_jacobi_list: list[int] | None = None,
         guess_list: list[int] | None = None,
-    ) -> torch.Tensor | list[torch.Tensor]:
+    ) -> torch.Tensor:
         """_summary_
 
         Args:
@@ -192,7 +192,7 @@ class TarFlow(torch.nn.Module):
             return_sequence (bool, optional): 是否返回序列. 若为否, 则仅返回最终结果(图片); 否则, 将返回每层 MetaBlock 处理后的结果 Defaults to False.
 
         Returns:
-            torch.Tensor | list[torch.Tensor]: _description_
+            torch.Tensor
         """
 
         num_GS_list = num_GS_list or [0] * self._config.blocks_num
